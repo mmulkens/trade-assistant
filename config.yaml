@@ -22,6 +22,18 @@ signal_engine:
   breakout_period: 50
   near_52wk_high_pct: 5
   benchmark: '^STOXX50E'
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal_period: 9
+  atr_period: 14
+  swing_low_period: 10
+  stop_atr_multiplier: 1.5
+  stop_hard_cap_pct: 8.0
+  min_rr_ratio: 2.0
+  pullback_tolerance_pct: 2.0
+  liquidity_min_turnover: 1000000   # €1M avg 20-day price×volume
+  liquidity_avg_days: 20
+  db_path: './data/signals.db'
 
 position_manager:
   trail_trigger_r: 1.5

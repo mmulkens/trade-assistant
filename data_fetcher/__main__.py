@@ -1,10 +1,24 @@
 """
-CLI entry point: python -m data_fetcher [options] [TICKER ...]
+__main__.py — CLI entry point for the Data Fetcher.
 
-Reads config from config.yaml (or --config path). Tickers can be supplied as
-positional args or via --ticker-file (one ticker per line). If neither is
-provided the watchlist custom list from config is used.
+Usage
+-----
+    python -m data_fetcher                          # fetch full watchlist (delta)
+    python -m data_fetcher --full-refresh           # re-download everything
+    python -m data_fetcher ASML.AS SAP.DE MC.PA     # fetch specific tickers
+    python -m data_fetcher --ticker-file my.txt     # load tickers from file
+
+Ticker resolution order (first match wins):
+  1. Positional ticker arguments on the command line.
+  2. --ticker-file: plain text file, one ticker per line, # lines ignored.
+  3. Watchlist files configured in config.yaml (eurostoxx600_file, custom_file)
+     plus the inline watchlist.custom list.
+
+Exit codes:
+  0 — all tickers succeeded (or were skipped as already up to date)
+  1 — one or more tickers failed after retries, or no tickers were found
 """
+
 import argparse
 import sys
 from pathlib import Path
@@ -13,15 +27,24 @@ import yaml
 
 
 def _load_config(path: str) -> dict:
+    """Load and parse config.yaml (or any YAML file passed via --config)."""
     with open(path, encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
 def _tickers_from_tsv(path: str) -> list[str]:
-    """Return the first column of a tab-separated ticker file, skipping the header."""
+    """
+    Extract ticker symbols from a tab-separated watchlist file.
+
+    Expected file format (header on line 1, data from line 2 onward):
+        ticker\tname\tcountry
+        ASML.AS\tASML HOLDING NV\tNL
+
+    Only the first column is read; blank lines are skipped.
+    """
     lines = Path(path).read_text(encoding="utf-8").splitlines()
     tickers = []
-    for line in lines[1:]:  # skip header
+    for line in lines[1:]:   # skip the header row
         parts = line.split("\t")
         if parts and parts[0].strip():
             tickers.append(parts[0].strip())
@@ -29,6 +52,17 @@ def _tickers_from_tsv(path: str) -> list[str]:
 
 
 def _load_watchlist(config: dict) -> list[str]:
+    """
+    Build the full ticker list from config.yaml watchlist settings.
+
+    Sources combined in order (duplicates removed, order preserved):
+      1. eurostoxx600_file — TSV file with the 298 STOXX 600 constituents.
+      2. custom_file       — TSV file for manually curated EU names.
+      3. custom            — Inline YAML list for quick one-off additions.
+
+    The benchmark ticker (^STOXX50E) is NOT included here — DataFetcher.run()
+    always prepends it automatically.
+    """
     wl = config.get("watchlist", {})
     tickers: list[str] = []
 
@@ -37,11 +71,15 @@ def _load_watchlist(config: dict) -> list[str]:
 
     if wl.get("custom_file"):
         path = wl["custom_file"]
+        # custom_file is optional; skip silently if it doesn't exist yet
         if Path(path).exists():
             tickers.extend(_tickers_from_tsv(path))
 
     tickers.extend(wl.get("custom", []))
-    return list(dict.fromkeys(tickers))  # deduplicate, preserve order
+
+    # Preserve insertion order while removing any duplicates that arise from
+    # a ticker appearing in both eurostoxx600_file and custom
+    return list(dict.fromkeys(tickers))
 
 
 def main() -> None:
@@ -59,18 +97,19 @@ def main() -> None:
     parser.add_argument(
         "--ticker-file",
         metavar="FILE",
-        help="Path to a file with one ticker per line",
+        help="Path to a plain-text file with one ticker per line",
     )
     parser.add_argument(
         "tickers",
         nargs="*",
         metavar="TICKER",
-        help="Tickers to fetch (overrides watchlist if provided)",
+        help="Explicit tickers to fetch; overrides the watchlist when provided",
     )
     args = parser.parse_args()
 
     config = _load_config(args.config)
 
+    # Resolve ticker list according to the priority order described above
     if args.tickers:
         tickers = args.tickers
     elif args.ticker_file:
@@ -82,11 +121,12 @@ def main() -> None:
     if not tickers:
         print(
             "No tickers specified. Pass tickers as arguments, use --ticker-file, "
-            "or populate watchlist.custom in config.yaml.",
+            "or populate watchlist.eurostoxx600_file / watchlist.custom in config.yaml.",
             file=sys.stderr,
         )
         sys.exit(1)
 
+    # Defer heavy imports until after argument validation so --help is instant
     from utils.json_logger import get_logger
     from data_fetcher.providers import get_provider
     from data_fetcher.fetcher import DataFetcher
