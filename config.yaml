@@ -40,7 +40,8 @@ orders:
   stop_limit_band_pct: 0.4
 
 watchlist:
-  eurostoxx600: true
+  eurostoxx600_file: './data_fetcher/tickers/eurostoxx600.txt'
+  custom_file: './data_fetcher/tickers/eu_custom.txt'
   custom: []
 
 notifications:

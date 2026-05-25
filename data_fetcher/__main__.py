@@ -17,6 +17,33 @@ def _load_config(path: str) -> dict:
         return yaml.safe_load(fh)
 
 
+def _tickers_from_tsv(path: str) -> list[str]:
+    """Return the first column of a tab-separated ticker file, skipping the header."""
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    tickers = []
+    for line in lines[1:]:  # skip header
+        parts = line.split("\t")
+        if parts and parts[0].strip():
+            tickers.append(parts[0].strip())
+    return tickers
+
+
+def _load_watchlist(config: dict) -> list[str]:
+    wl = config.get("watchlist", {})
+    tickers: list[str] = []
+
+    if wl.get("eurostoxx600_file"):
+        tickers.extend(_tickers_from_tsv(wl["eurostoxx600_file"]))
+
+    if wl.get("custom_file"):
+        path = wl["custom_file"]
+        if Path(path).exists():
+            tickers.extend(_tickers_from_tsv(path))
+
+    tickers.extend(wl.get("custom", []))
+    return list(dict.fromkeys(tickers))  # deduplicate, preserve order
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Trade Assistant — Data Fetcher")
     parser.add_argument(
@@ -50,7 +77,7 @@ def main() -> None:
         tickers = Path(args.ticker_file).read_text(encoding="utf-8").splitlines()
         tickers = [t.strip() for t in tickers if t.strip() and not t.startswith("#")]
     else:
-        tickers = config.get("watchlist", {}).get("custom", [])
+        tickers = _load_watchlist(config)
 
     if not tickers:
         print(

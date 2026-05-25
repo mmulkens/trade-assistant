@@ -1,8 +1,46 @@
+import base64
+import ssl
+import tempfile
 from abc import ABC, abstractmethod
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
+from curl_cffi import requests as cffi_requests
+
+
+def _build_ca_bundle() -> str:
+    """
+    Export Windows root + intermediate CA certs to a temp PEM file so that
+    curl_cffi's bundled libcurl can verify TLS chains that include corporate or
+    AV-injected root certificates not present in certifi's bundle.
+    Returns the path to the temp file.
+    """
+    chunks: list[str] = []
+    for store in ("ROOT", "CA"):
+        try:
+            for cert_der, _encoding, _trust in ssl.enum_certificates(store):
+                b64 = base64.b64encode(cert_der).decode("ascii")
+                # PEM requires 64-character line wrapping
+                wrapped = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+                chunks.append(f"-----BEGIN CERTIFICATE-----\n{wrapped}\n-----END CERTIFICATE-----")
+        except Exception:
+            pass
+
+    import certifi
+    chunks.append(Path(certifi.where()).read_text(encoding="ascii"))
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".pem", delete=False, encoding="ascii"
+    )
+    tmp.write("\n\n".join(chunks))
+    tmp.close()
+    # libcurl on Windows needs forward slashes in the CA bundle path
+    return tmp.name.replace("\\", "/")
+
+
+_CA_BUNDLE = _build_ca_bundle()
 
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 
@@ -14,8 +52,15 @@ class BaseProvider(ABC):
 
 
 class YFinanceProvider(BaseProvider):
+    def __init__(self) -> None:
+        # Browser impersonation avoids Yahoo rate-limits; custom CA bundle trusts
+        # corporate/AV-injected root certs that aren't in certifi's default bundle.
+        self._session = cffi_requests.Session(
+            impersonate="chrome", verify=_CA_BUNDLE
+        )
+
     def fetch(self, ticker: str, start: date, end: date) -> pd.DataFrame:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker, session=self._session)
         df = t.history(
             start=start.isoformat(),
             end=end.isoformat(),
