@@ -1,66 +1,172 @@
+# =============================================================================
+# Trade Assistant — Master Configuration
+# =============================================================================
+# All components read from this single file.
+# No magic numbers in code — every tunable value lives here.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Risk management (enforced by the Risk Layer)
+# -----------------------------------------------------------------------------
 risk:
-  max_position_risk_pct: 1.5
-  max_open_risk_pct: 6.0
-  daily_loss_limit_pct: 3.0
+  max_position_risk_pct: 1.5    # Maximum % of total portfolio value risked on a single trade
+                                 # (entry price − stop price) × shares / portfolio value
+  max_open_risk_pct: 6.0        # Maximum total open risk across all positions combined
+                                 # Prevents over-exposure when multiple trades are open
+  daily_loss_limit_pct: 3.0     # If the portfolio loses this % in a single day, halt all
+                                 # new orders for the remainder of the session
 
+
+# -----------------------------------------------------------------------------
+# Transaction costs (used by Order Executor for R:R validation)
+# -----------------------------------------------------------------------------
 costs:
-  tob_pct: 0.35
-  min_rr_after_costs: 2.0
+  tob_pct: 0.35                 # Belgian Tax on Stock Exchange Transactions (TOB), per side
+                                 # Applied to both entry and exit; currently 0.35% per transaction
+  min_rr_after_costs: 2.0       # Minimum reward:risk ratio required AFTER deducting costs
+                                 # Order Executor rejects trades that don't clear this threshold
 
+
+# -----------------------------------------------------------------------------
+# Data Fetcher
+# -----------------------------------------------------------------------------
 data_fetcher:
-  provider: 'yfinance'
-  history_days: 300
-  workers: 8
-  batch_size: 16
-  batch_pause_seconds: 2
-  cache_dir: './cache'
-  max_retries: 3
-  retry_backoff_seconds: 1.0
+  provider: 'yfinance'          # OHLCV data provider — 'yfinance' (default) or 'eodhd'
+  history_days: 300             # Calendar days of OHLCV history to fetch per ticker
+                                 # 300 days ≈ 210 trading bars — sufficient for all indicators
+                                 # (EMA200 needs ~200 bars; 52-week high needs ~252 trading bars)
+  workers: 8                    # Parallel threads per batch for fetching tickers
+  batch_size: 16                # Tickers per batch; pause_seconds applied between batches
+                                 # Keeps Yahoo Finance from rate-limiting the requests
+  batch_pause_seconds: 2        # Seconds to wait between batches
+  cache_dir: './cache'          # Directory for Parquet files (one file per ticker)
+  max_retries: 3                # Retry attempts per ticker on transient fetch errors
+  retry_backoff_seconds: 1.0    # Base wait between retries; multiplied by attempt number
 
+
+# -----------------------------------------------------------------------------
+# Signal Engine
+# -----------------------------------------------------------------------------
 signal_engine:
-  ema_period: 21
-  breakout_period: 50
-  near_52wk_high_pct: 5
-  benchmark: '^STOXX50E'
-  macd_fast: 12
-  macd_slow: 26
-  macd_signal_period: 9
-  atr_period: 14
-  swing_low_period: 10
-  stop_atr_multiplier: 1.5
-  stop_hard_cap_pct: 8.0
-  min_rr_ratio: 2.0
-  pullback_tolerance_pct: 2.0
-  liquidity_min_turnover: 1000000   # €1M avg 20-day price×volume
-  liquidity_avg_days: 20
-  db_path: './data/signals.db'
 
+  # --- Strategy A: EMA Pullback ---
+  ema_period: 21                # EMA period used as the pullback anchor
+                                 # 21 is a Fibonacci number widely used by institutional
+                                 # swing traders (Minervini / IBD); creates real support
+
+  # --- Strategy B: Breakout ---
+  breakout_period: 50           # Lookback bars for the highest-high breakout check
+                                 # 20 days fires too often; 52 weeks too rarely; 50 is the sweet spot
+
+  # --- Shared: conviction annotation ---
+  near_52wk_high_pct: 5         # Signal is marked 'elevated' if close is within this %
+                                 # of the 52-week high — indicates a leadership stock
+
+  # --- Market regime filter ---
+  benchmark: '^STOXX50E'        # Yahoo Finance ticker for the regime benchmark (Euro Stoxx 50)
+                                 # If benchmark closes below its 200 EMA → bear regime → no signals
+
+  # --- MACD indicator (shared across both strategies) ---
+  macd_fast: 12                 # Fast EMA period for MACD line calculation
+  macd_slow: 26                 # Slow EMA period for MACD line calculation
+  macd_signal_period: 9         # Signal line period (EMA of the MACD line)
+                                 # Standard 12/26/9 parameters used across both strategies
+
+  # --- ATR (used for stop placement) ---
+  atr_period: 14                # Wilder's ATR lookback period
+                                 # Used to set a volatility-adjusted floor under the structural stop
+
+  # --- Stop price calculation ---
+  swing_low_period: 10          # Bars to look back for the structural stop (lowest low)
+                                 # Stop is placed below the most recent swing low
+  stop_atr_multiplier: 1.5      # ATR floor multiplier: stop must be at least this many ATRs
+                                 # below entry — prevents stops that are too tight for daily noise
+  stop_hard_cap_pct: 8.0        # Maximum stop distance as % of entry price
+                                 # Prevents extreme stops on volatile names; signals that hit
+                                 # the cap are flagged with ⚠ CAP in the output
+
+  # --- Target price ---
+  min_rr_ratio: 2.0             # Minimum reward:risk ratio for the technical target
+                                 # target = entry + (min_rr_ratio × risk)
+                                 # Note: the Order Executor re-checks R:R after adding costs
+
+  # --- Strategy A: trend filter Guard B ---
+  trend_drawdown_guard_pct: 30.0  # Reject if price is more than this % below its recent high
+                                   # Catches freefall situations before lagging EMAs adjust
+  trend_drawdown_period: 20        # Lookback bars for the Guard B recent-high calculation
+
+  # --- Strategy B: volume confirmation ---
+  breakout_volume_multiplier: 1.5  # Breakout bar must have volume >= this × 20-day average
+                                    # Ensures institutional participation; low-volume breakouts
+                                    # have significantly lower follow-through probability
+
+  # --- Liquidity classification ---
+  liquidity_min_turnover: 1000000  # Average daily turnover (price × volume) below this value
+                                    # classifies an instrument as 'thin' (€1M threshold)
+                                    # Thin instruments use limit orders instead of market orders
+  liquidity_avg_days: 20           # Days to average for the turnover calculation
+
+  # --- Output ---
+  db_path: './data/signals.db'  # SQLite database for persisting all fired signals
+
+
+# -----------------------------------------------------------------------------
+# Position Manager
+# -----------------------------------------------------------------------------
 position_manager:
-  trail_trigger_r: 1.5
-  time_limit_days: 7
-  atr_period: 14
-  stop_proximity_pct: 25
-  atr_buckets:
-    low_threshold_pct: 1.5
-    high_threshold_pct: 3.0
-    low_multiplier: 2.0
-    medium_multiplier: 2.5
-    high_multiplier: 3.0
+  trail_trigger_r: 1.5          # Move stop to breakeven once profit reaches this multiple of
+                                 # initial risk (e.g. 1.5R profit → stop moves to entry)
+  time_limit_days: 7            # Exit any position that has not hit its target within this
+                                 # many trading days — prevents capital being tied up in stalled trades
+  atr_period: 14                # ATR period for trailing stop calculations (Wilder's)
+  stop_proximity_pct: 25        # If current price is within this % of the trailing stop,
+                                 # consider the position at risk and tighten monitoring
 
+  atr_buckets:                  # ATR-based trailing stop multipliers, tiered by volatility
+    low_threshold_pct: 1.5      # ATR% below this = low volatility bucket
+    high_threshold_pct: 3.0     # ATR% above this = high volatility bucket
+                                 # Between the two thresholds = medium volatility
+    low_multiplier: 2.0         # Trailing stop distance = low_multiplier × ATR  (tight trail)
+    medium_multiplier: 2.5      # Trailing stop distance for medium-volatility instruments
+    high_multiplier: 3.0        # Trailing stop distance = high_multiplier × ATR (loose trail)
+
+
+# -----------------------------------------------------------------------------
+# Order parameters
+# -----------------------------------------------------------------------------
 orders:
-  entry_buffer_pct: 0.5
-  stop_limit_band_pct: 0.4
+  entry_buffer_pct: 0.5         # Buy limit price is set this % above the signal's entry_price
+                                 # Ensures the order fills on momentum without missing the move
+  stop_limit_band_pct: 0.4      # Stop-limit orders: limit price is set this % below the stop
+                                 # Provides a band so the limit doesn't prevent execution in
+                                 # fast-moving markets
 
+
+# -----------------------------------------------------------------------------
+# Watchlist sources
+# -----------------------------------------------------------------------------
 watchlist:
-  eurostoxx600_file: './data_fetcher/tickers/eurostoxx600.txt'
-  custom_file: './data_fetcher/tickers/eu_custom.txt'
-  custom: []
+  eurostoxx600_file: './data_fetcher/tickers/eurostoxx600.txt'  # STOXX 600 constituents (298 tickers)
+  custom_file: './data_fetcher/tickers/eu_custom.txt'           # Manually curated supplemental list
+  custom: []                    # Inline list — add tickers here for quick one-off additions
+                                 # e.g. custom: ['SHOP.AS', 'ADYEN.AS']
 
+
+# -----------------------------------------------------------------------------
+# Notifications (Telegram)
+# -----------------------------------------------------------------------------
 notifications:
-  telegram_bot_token: ''
-  telegram_chat_id: ''
+  telegram_bot_token: ''        # Bot token from @BotFather — leave empty to disable notifications
+  telegram_chat_id: ''          # Target chat ID (your personal chat or a group)
 
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
 logging:
-  log_dir: './logs'
-  sqlite_path: './data/trading.db'
-  retain_days: 90
+  log_dir: './logs'             # Directory for JSON-lines log files (one per component per day)
+                                 # Format: component_YYYY-MM-DD.jsonl
+  sqlite_path: './data/trading.db'  # SQLite database for trade analytics and position history
+                                     # Separate from signals.db which holds signal scan results
+  retain_days: 90               # Log files older than this many days are eligible for cleanup

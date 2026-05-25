@@ -1,23 +1,36 @@
 # Signal Engine
 
-Scans the EU equity watchlist daily and emits structured trade signals when a setup meets all required conditions. Two independent strategies run in parallel; a signal fires when **either** passes (OR logic). Both firing simultaneously, or price near a 52-week high, triggers an **elevated conviction** annotation.
-
-Sits between the Data Fetcher (Parquet cache) and the Risk Layer in the pipeline:
+The Signal Engine is the second component in the Trade Assistant pipeline. It runs once per trading day, scans the full EU equity watchlist, and identifies stocks that have set up a high-quality entry condition. For every qualifying stock it emits a structured **Signal** — a precise set of trade parameters that the downstream Risk Layer uses to decide whether and how to place an order.
 
 ```
-Data Fetcher → Signal Engine → Risk Layer → Order Executor → Position Manager
+Data Fetcher  ──►  Signal Engine  ──►  Risk Layer  ──►  Order Executor  ──►  Position Manager
+(Parquet cache)   (this module)
 ```
 
 ---
 
-## Files
+## What it produces
 
-| File | Purpose |
+A Signal is not a recommendation to buy. It is a statement that, *as of today's close*, a particular stock satisfies a defined set of technical conditions. The Risk Layer still applies portfolio-level checks (position sizing, open risk limits) before any order is placed.
+
+Each Signal contains:
+
+| Field | Description |
 |---|---|
-| `indicators.py` | Pure indicator functions: EMA, MACD, ATR, RS line. No side effects. |
-| `engine.py` | `SignalEngine` class + `Signal` dataclass. Market regime check, strategy A & B logic, stop/target calculation. |
-| `db.py` | SQLite persistence — initialise schema, insert signals into `signals.db`. |
-| `__main__.py` | CLI entry point (`python -m signal_engine`). Wires config, logger, engine, and DB together. |
+| `ticker` | Yahoo Finance ticker, e.g. `ASML.AS` |
+| `entry_price` | Today's closing price — the intended entry level |
+| `stop_price` | The technical stop loss, fixed at signal time |
+| `target_price` | The minimum acceptable target (2:1 reward:risk) |
+| `signal_type` | `pullback`, `breakout`, or `pullback+breakout` |
+| `conviction` | `standard` or `elevated` |
+| `liquidity_class` | `liquid` or `thin` — affects order type downstream |
+| `stop_capped` | `True` if the hard cap was applied to the stop distance |
+| `strategy_a_fired` | Whether the EMA Pullback strategy triggered |
+| `strategy_b_fired` | Whether the Breakout strategy triggered |
+| `near_52wk_high` | Whether price is within 5% of its 52-week high |
+| `market_regime` | `bull` or `bear` at the time of the scan |
+| `rs_value` | Stock price divided by the ^STOXX50E benchmark price |
+| `earnings_flag` | `None` — stub until IBKR fundamental data is wired up |
 
 ---
 
@@ -30,176 +43,295 @@ python -m signal_engine
 # Scan specific tickers only
 python -m signal_engine ASML.AS SIE.DE ALV.DE
 
-# Custom config path
+# Custom config file
 python -m signal_engine --config /path/to/config.yaml
 ```
 
-Output is printed to stdout and also persisted to `./data/signals.db`.  
-JSON-lines logs are written to `./logs/signal_engine_YYYY-MM-DD.jsonl`.
+Results are printed to the terminal and saved to `./data/signals.db` (SQLite).  
+Detailed logs go to `./logs/signal_engine_YYYY-MM-DD.jsonl` (JSON-lines).
 
 ---
 
-## Market Regime Gate
+## Full evaluation pipeline
 
-Before scanning any ticker, the engine loads `^STOXX50E` from the Parquet cache and computes its 200-period EMA.
+For every scan run, the engine works through the following steps in order.
 
-- **Bull** (`close >= EMA200`): scan proceeds normally.
-- **Bear** (`close < EMA200`): the entire scan is skipped and an empty signal list is returned.
+### Step 1 — Market regime check
 
-Individual breakouts and pullbacks in a bear-market environment have significantly lower follow-through rates. This is a hard gate, not a soft filter.
+Before looking at any individual stock, the engine checks the health of the broad market by loading the ^STOXX50E index from the cache and comparing its closing price to its 200-period EMA.
+
+- **Bull** (`close ≥ EMA200`): scan proceeds.
+- **Bear** (`close < EMA200`): the entire scan is aborted and zero signals are returned.
+
+**Why this matters:** individual stock setups — even technically perfect ones — have significantly lower follow-through probability when the broad market is in a downtrend. This is a hard gate, not a soft filter.
+
+---
+
+### Step 2 — General trend filters (applied to every ticker, before any strategy)
+
+These two checks run before either strategy is evaluated. A ticker that fails either filter is skipped entirely, regardless of what the strategies would say.
+
+#### Guard A — EMA chain alignment
+
+```
+EMA21 > EMA50 > EMA100 > EMA200
+```
+
+All four exponential moving averages must be in descending order from fastest to slowest. This confirms the stock is in a multi-timeframe uptrend. The EMA21 is the most sensitive of the four — it turns negative (below EMA50) in a downtrending stock well before the slower averages catch up. This makes it an early-warning gate.
+
+**Why this applies to breakouts too:** a stock can technically close above its 50-day high while its EMAs are still in a downtrend alignment — for example, after a sharp drop followed by a single strong recovery bar. That is not the setup we want. The EMA chain check ensures any breakout or pullback signal is in the context of a genuine multi-week uptrend.
+
+#### Guard B — Freefall rejection
+
+```
+(highest high of last 20 bars − close) / highest high  ≤  30%
+```
+
+If the stock is more than 30% below its 20-day high, it is in a freefall. Because EMAs are lagging indicators, a stock in freefall can still pass Guard A for several bars while the slower EMAs gradually catch up to the new price reality. Guard B closes this window by directly measuring recent price deterioration.
+
+---
+
+### Step 3 — Strategy evaluation (OR logic)
+
+Both strategies are evaluated independently. A signal fires if **either** passes. Both firing simultaneously is rare — a pullback and a breakout are nearly mutually exclusive at the same moment — but when it happens, it triggers an elevated conviction annotation.
 
 ---
 
 ## Strategy A — EMA Pullback
 
-Fires when **all** of the following are true:
+**The idea:** buy a strong uptrending stock at a natural support level, catching the earliest sign that sellers are exhausted.
 
-| # | Condition | Why |
-|---|---|---|
-| 1 | `close > EMA50` | Price is above the medium-term trend line |
-| 2 | `EMA21 > EMA50` | Fast EMA above slow EMA — bullish momentum ordering |
-| 3 | `EMA50 > EMA100 > EMA200` | All major averages in bullish stack |
-| 4a | `abs(close − EMA21) / EMA21 ≤ 2%` | Price is approaching the 21 EMA from above (OR) |
-| 4b | `low ≤ EMA21 < close` | Intraday wick tagged the EMA; close recovered above it |
-| 5 | MACD histogram `< 0` and rising for 2 consecutive bars | Momentum recovering from pullback, but not yet extended |
+All four conditions must be true on the same bar.
 
-**21 EMA rationale:** Fibonacci number; widely watched by institutional swing traders (Minervini / IBD methodology). Enough market participants observe this level to generate real support on pullbacks. EMA20 has less institutional backing; EMA10 is too noisy for swing timeframes.
+### Condition 1 — Price above EMA50
 
-**MACD histogram condition detail:** The requirement is `h[-1] > h[-2] > h[-3]` *and* `h[-1] < 0`. This captures the "dark red to light red" transition — momentum is recovering from weakness but has not yet turned positive. Avoids signals on already-extended bounces.
+```
+close > EMA50
+```
+
+The Guard A chain already confirms EMA21 > EMA50. This additional check ensures *price itself* has not broken below the medium-term trend line. A stock where EMA21 > EMA50 but price has dropped below EMA50 is structurally weakening.
+
+### Condition 2 — EMA21 touch or recovery
+
+This is the precise definition of a "pullback to the 21 EMA". Two cases are accepted:
+
+**Case A — Same-bar wick rejection:**
+```
+today.low  ≤  EMA21
+today.close  >  EMA21
+```
+The candle's intraday low touched or pierced the EMA, but the day closed back above it. Classic support-holding behaviour — sellers drove price into the EMA and buyers pushed it back up before the close.
+
+**Case B — Prior-bar breach, today's recovery:**
+```
+(yesterday.low < EMA21  OR  yesterday.close < EMA21)
+AND  today.close > EMA21
+```
+Price dipped below (or closed below) the EMA on the previous bar. Today it has fully reclaimed the level. A one-day-delayed recovery is equally valid as a setup signal.
+
+**What does NOT qualify:**
+- Price approaching the EMA from above without touching it (proximity is not contact)
+- Price below the EMA with no recovery candle (that is a breakdown, not a pullback)
+- Price below the EMA for two or more bars without reclaiming it
+
+### Condition 3 — MACD histogram "dark red to light red"
+
+The MACD histogram (fast EMA minus slow EMA, minus the signal line) must show a specific three-bar shape:
+
+```
+h[-2] < h[-3]    — prior bar: histogram was getting more negative  (prior weakness)
+h[-1] > h[-2]    — today: histogram has ticked up                  (first improvement)
+h[-1] < 0        — histogram is still negative                     (not yet extended)
+```
+
+In plain terms: selling pressure was intensifying, and has now just begun to ease — but momentum has not yet turned positive. This is the earliest possible signal of a rotation from selling to buying interest, and it confirms we are entering at the turning point rather than chasing a move already in progress.
+
+**Why the prior-decline requirement?** Without it, the histogram check could fire on a positive histogram that happens to have ticked up slightly — completely the wrong market condition for a pullback entry. Requiring that the histogram was previously declining confirms there was genuine selling pressure to recover from.
 
 ---
 
 ## Strategy B — 50-Day Breakout
 
-Fires when **all** of the following are true:
+**The idea:** buy a stock the moment it breaks out to new highs, when institutional money is visibly committing to the move.
 
-| # | Condition | Why |
-|---|---|---|
-| 1 | `close > max(high[-51:-1])` | Price closes above the highest high of the prior 50 trading days |
-| 2 | `MACD line > 0` | Overall trend momentum is positive |
-| 3 | `MACD line[-1] > MACD line[-2]` | Momentum is accelerating on the breakout |
+All three conditions must be true on the same bar.
 
-**50-day lookback rationale:** 20 days fires too frequently with lower conviction. 52 weeks fires too rarely as a daily scanner primary. 50 days balances signal frequency against conviction quality.
+### Condition 1 — Fresh breakout above 50-day high
 
-**Look-ahead guard:** The breakout window is `df["high"].iloc[-(N+1):-1]` — today's bar is excluded from the comparison so we test "did today's close exceed the *prior* N-day high?"
+**Price condition:**
+```
+today.close  >  max(high, prior 50 trading days)
+```
+Today's close exceeds the highest high of the past 50 trading days (today's bar is excluded from the lookback to avoid look-ahead bias).
+
+**Why 50 days?** A 20-day lookback fires too frequently — too many short-lived false breaks. A 52-week lookback fires too rarely to be useful as a daily scanner. 50 days is the practical balance between signal frequency and conviction.
+
+**Freshness check — this must be the first day of the breakout:**
+```
+yesterday.close  ≤  max(high, the 50 days ending two days ago)
+```
+If yesterday's close already exceeded the 50-day high as it stood at yesterday's close, the breakout already fired yesterday. Signalling again today means entering a day (or more) late, after the stock has already moved. This matters for two reasons:
+
+1. The intended entry price has deteriorated — you are chasing.
+2. The stop distance inflates: the structural swing low is fixed at the breakout level while the entry price has risen, which pushes the risk percentage higher and causes more signals to hit the hard cap unnecessarily.
+
+The freshness check ensures the engine only signals on day one.
+
+### Condition 2 — MACD line above zero and rising
+
+```
+MACD line > 0                          — broad trend momentum is positive
+MACD line today > MACD line yesterday  — momentum is currently accelerating
+```
+
+The MACD *line* (not histogram) is used here, because it reflects sustained trend direction rather than short-term momentum oscillation. A line above zero means the fast EMA is above the slow EMA — the stock has been trending up for an extended period. A rising line confirms that trend is strengthening on the breakout day.
+
+### Condition 3 — Volume confirmation
+
+```
+today.volume  ≥  1.5 ×  avg(volume, last 20 trading days)
+```
+
+A breakout without elevated volume is suspect. Volume represents conviction — when institutional money is buying, it shows up in the volume data. A stock that closes above its 50-day high on average or below-average volume is more likely to stall and reverse than to follow through. The 1.5× threshold is the standard from IBD / O'Neil breakout methodology.
 
 ---
 
-## Stop, Target & Conviction
+## Stop price calculation (3 steps)
 
-### Stop Price (3-step calculation)
+The stop is calculated the same way regardless of which strategy fired.
+
+### Step 1 — Structural stop (swing low)
 
 ```
-1. structural_stop = min(low[-swing_low_period:])   # lowest low of last N bars
-2. atr_stop        = entry − (stop_atr_multiplier × ATR14)
-3. stop            = min(structural_stop, atr_stop)  # take the wider stop
-4. if (entry − stop) / entry > stop_hard_cap_pct:
-       stop = entry × (1 − stop_hard_cap_pct / 100)  # hard cap
+structural_stop = min(low, last 10 trading bars)
 ```
 
-**Why take the wider stop?** If the structural swing low is closer to entry than 1.5×ATR, the stop is vulnerable to being triggered by normal daily noise. Taking the lower of the two ensures the trade always has at least 1.5 ATR of breathing room.
+The stop is placed below the most recent swing low — the lowest intraday price of the past 10 bars. The logic: if price undercuts a level that buyers were previously defending, the trade thesis is invalidated.
 
-**Hard cap (default 8%):** Prevents extreme stops on very volatile or thinly traded instruments from inflating position risk beyond the 1.5% portfolio cap enforced by the Risk Layer.
+### Step 2 — ATR floor
 
-All stop parameters are configurable in `config.yaml` under `signal_engine`.
+```
+atr_stop = entry − (1.5 × ATR14)
+stop = min(structural_stop, atr_stop)   ← take the lower (wider) of the two
+```
 
-### Target Price
+If the structural swing low happens to be very close to the entry price, the stop is vulnerable to being triggered by normal daily price noise. The ATR (Average True Range over 14 bars) measures typical daily volatility. Ensuring the stop is at least 1.5×ATR below entry gives the trade enough breathing room to survive routine fluctuations.
+
+Taking the *lower* of the two stops means: whichever level gives more distance from entry — the structural low or the ATR floor — wins. This produces the most defensible stop.
+
+### Step 3 — Hard cap
+
+```
+if (entry − stop) / entry  >  8%:
+    stop = entry × 0.92
+    stop_capped = True
+```
+
+No stop may be more than 8% below the entry price. This prevents extreme stop distances on very volatile or thinly traded names from inflating the position risk beyond the 1.5% portfolio cap enforced by the Risk Layer. Signals where the hard cap was applied are flagged with `⚠ CAP` in the terminal output and `stop_capped = True` in the Signal object — they warrant manual review before acting.
+
+---
+
+## Target price
 
 ```
 risk   = entry − stop
-target = entry + (min_rr_ratio × risk)   # default: 2.0 → 2:1 R:R
+target = entry + (2.0 × risk)
 ```
 
-The Order Executor re-validates R:R *after* applying transaction costs (TOB tax at 0.35% per side) before touching the market.
-
-### Conviction
-
-| Condition | Conviction |
-|---|---|
-| Only one strategy fired | `standard` |
-| Both strategies fired simultaneously | `elevated` |
-| Price within `near_52wk_high_pct`% (default 5%) of 52-week high | `elevated` |
-| Both strategies fired **and** near 52-week high | `elevated` (not "super-elevated" — kept binary) |
+The minimum acceptable target is a 2:1 reward-to-risk ratio at the technical level. Note that the Order Executor re-validates this ratio *after* adding transaction costs (0.35% Belgian stock tax per side) before placing any order — a signal that passes the 2:1 technical target may still be rejected if it doesn't clear 2:1 after costs.
 
 ---
 
-## Liquidity Classification
+## Conviction annotation
 
-```
-avg_turnover = mean(close × volume, last 20 days)
-classification = 'thin' if avg_turnover < €1,000,000 else 'liquid'
-```
+A signal is marked `elevated` (versus `standard`) when either of the following is true:
 
-`thin` instruments receive different treatment downstream: the Order Executor uses limit orders instead of market/stop-market orders, and the stop order type changes to avoid excessive slippage in low-volume names.
+- **Both strategies fired on the same ticker** — a pullback and a breakout occurring simultaneously is rare and indicates an unusually strong setup.
+- **Price is within 5% of its 52-week high** — stocks near new 52-week highs are in a leadership position in the market, and breakouts/pullbacks from those levels have historically higher follow-through rates.
+
+Conviction is an annotation passed to the Risk Layer and notifications. It does not automatically change position sizing — that decision belongs to the Risk Layer.
 
 ---
 
-## Signal Output Contract
+## Liquidity classification
 
-Every emitted `Signal` has the following fields (see `engine.py → Signal`):
+```
+avg_daily_turnover = mean(close × volume,  last 20 trading days)
 
-| Field | Type | Description |
+'thin'   if avg_daily_turnover < €1,000,000
+'liquid' otherwise
+```
+
+Instruments with thin trading volumes receive different handling downstream: the Order Executor uses limit orders instead of market orders, and the stop order type changes to reduce slippage risk in low-volume names.
+
+---
+
+## Relative strength (RS) annotation
+
+```
+rs_value = stock close / ^STOXX50E close   (on matched dates)
+```
+
+The RS value is the stock's price divided by the benchmark index price. A rising RS line means the stock is outperforming the index. This is stored as an annotation on every signal — it is not a filter, but it is a useful secondary data point for manual review.
+
+---
+
+## Logging and persistence
+
+**JSON-lines log** (`./logs/signal_engine_YYYY-MM-DD.jsonl`):  
+Every fired signal and every skipped ticker is logged with a reason code. The log is the complete audit trail for the daily scan. Skip reasons use the format `component:reason_detail`, e.g. `strategy_a:histogram_not_negative` or `trend_filter:ema_chain_not_aligned`.
+
+**SQLite database** (`./data/signals.db`, table: `signals`):  
+Every fired Signal is persisted in full. The database accumulates across all scan runs, making it queryable for historical analysis (e.g. "how many breakout signals fired last month?", "which signals hit the stop cap?").
+
+---
+
+## File structure
+
+```
+signal_engine/
+├── __main__.py      CLI entry point — wires config, logger, engine, and DB
+├── engine.py        SignalEngine orchestrator + Signal dataclass
+├── strategy_a.py    Strategy A: EMA Pullback conditions
+├── strategy_b.py    Strategy B: 50-Day Breakout conditions
+├── indicators.py    Pure indicator functions: EMA, MACD, ATR, RS line
+├── db.py            SQLite schema + persistence functions
+└── README.md        This file
+```
+
+---
+
+## Configuration reference
+
+All parameters live in `config.yaml` under the `signal_engine` section.
+
+| Parameter | Default | Description |
 |---|---|---|
-| `instrument_id` | `str` | IBKR conid — stubbed as ticker until IBKR integration |
-| `ticker` | `str` | Yahoo Finance ticker (e.g. `ASML.AS`) |
-| `direction` | `str` | Always `'long'` in v1 |
-| `entry_price` | `float` | Last close at signal time |
-| `stop_price` | `float` | Technical stop, fixed at signal time |
-| `target_price` | `float` | Minimum 2:1 R:R target |
-| `signal_type` | `str` | `pullback` \| `breakout` \| `pullback+breakout` |
-| `liquidity_class` | `str` | `liquid` \| `thin` |
-| `conviction` | `str` | `standard` \| `elevated` |
-| `signal_timestamp` | `datetime` | UTC timestamp |
-| `earnings_flag` | `bool\|None` | Always `None` until IBKR `reqFundamentalData` is wired |
-| `strategy_a_fired` | `bool` | — |
-| `strategy_b_fired` | `bool` | — |
-| `near_52wk_high` | `bool` | — |
-| `market_regime` | `str` | `bull` \| `bear` \| `unknown` |
-| `rs_value` | `float\|None` | Stock / benchmark ratio (annotation only, not a filter) |
-
----
-
-## Configuration (`config.yaml` → `signal_engine` section)
-
-| Key | Default | Description |
-|---|---|---|
-| `ema_period` | `21` | EMA period for Strategy A pullback anchor |
-| `breakout_period` | `50` | Lookback for Strategy B highest high |
-| `near_52wk_high_pct` | `5` | % below 52-wk high for elevated conviction |
-| `benchmark` | `^STOXX50E` | Index for regime filter and RS line |
+| `ema_period` | `21` | EMA period for the Strategy A pullback anchor |
+| `breakout_period` | `50` | Lookback bars for the Strategy B highest-high check |
+| `near_52wk_high_pct` | `5` | Price must be within this % of its 52-week high for elevated conviction |
+| `benchmark` | `^STOXX50E` | Yahoo Finance ticker for the market regime check and RS line |
 | `macd_fast` | `12` | MACD fast EMA period |
 | `macd_slow` | `26` | MACD slow EMA period |
 | `macd_signal_period` | `9` | MACD signal line period |
-| `atr_period` | `14` | ATR lookback period (Wilder's) |
-| `swing_low_period` | `10` | Bars to look back for structural stop |
-| `stop_atr_multiplier` | `1.5` | ATR floor multiplier for stop distance |
-| `stop_hard_cap_pct` | `8.0` | Maximum stop distance as % of entry |
-| `min_rr_ratio` | `2.0` | Minimum reward:risk ratio for target |
-| `pullback_tolerance_pct` | `2.0` | Close within N% of EMA21 counts as pullback |
-| `liquidity_min_turnover` | `1000000` | €/day threshold for thin classification |
-| `liquidity_avg_days` | `20` | Days to average for turnover calculation |
-| `db_path` | `./data/signals.db` | SQLite output file |
+| `atr_period` | `14` | ATR lookback (Wilder's smoothing) |
+| `swing_low_period` | `10` | Bars to look back for the structural stop |
+| `stop_atr_multiplier` | `1.5` | ATR floor multiplier for minimum stop distance |
+| `stop_hard_cap_pct` | `8.0` | Maximum stop distance as % of entry price |
+| `min_rr_ratio` | `2.0` | Minimum reward:risk for the technical target |
+| `trend_drawdown_guard_pct` | `30.0` | Guard B: reject if price is more than this % below its recent high |
+| `trend_drawdown_period` | `20` | Guard B: bars to look back for the recent high |
+| `breakout_volume_multiplier` | `1.5` | Strategy B: breakout bar volume must be at least this × 20-day average |
+| `liquidity_min_turnover` | `1000000` | Daily price×volume below €1M → classified as `thin` |
+| `liquidity_avg_days` | `20` | Days to average for turnover and volume calculations |
+| `db_path` | `./data/signals.db` | SQLite output file path |
 
 ---
 
-## Stubbed Features (Phase 1)
+## Stubbed features (pending Phase 2)
 
-These features are architecturally present but not yet implemented:
-
-| Feature | Status | Blocking on |
+| Feature | Current state | Waiting on |
 |---|---|---|
-| `instrument_id` (IBKR conid) | Stubbed as ticker string | IBKR integration |
+| `instrument_id` (IBKR conid) | Returns the ticker string as a placeholder | IBKR API integration |
 | `earnings_flag` | Always `None` | IBKR `reqFundamentalData` |
-| RS line as a filter | Currently annotation-only | Design decision (may stay as annotation) |
-
----
-
-## Design Decisions & Rejected Alternatives
-
-See `trade_assistant_design.md` — Section 3 (Signal Engine) for full rationale.
-
-Key rejections:
-- **AND(A, B)** combined signal: A pullback and a breakout are nearly mutually exclusive at the same moment — AND logic would almost never fire.
-- **MACD as standalone Strategy C**: Derived entirely from price, adds no independent informational value, lags in trending markets.
-- **VCP (Minervini)**: Volatility contraction detection is inherently subjective — programmatic definition consistently fails validation.
-- **Higher highs / lower lows for uptrend**: More precise but significantly harder to implement robustly than the EMA stack.
+| RS line as a filter | Currently an annotation only — not used to gate signals | Design decision |
