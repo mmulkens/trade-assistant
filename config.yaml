@@ -1,0 +1,53 @@
+risk:
+  max_position_risk_pct: 1.5
+  max_open_risk_pct: 6.0
+  daily_loss_limit_pct: 3.0
+
+costs:
+  tob_pct: 0.35
+  min_rr_after_costs: 2.0
+
+data_fetcher:
+  provider: 'yfinance'
+  history_days: 300
+  workers: 8
+  batch_size: 16
+  batch_pause_seconds: 2
+  cache_dir: './cache'
+  max_retries: 3
+  retry_backoff_seconds: 1.0
+
+signal_engine:
+  ema_period: 21
+  breakout_period: 50
+  near_52wk_high_pct: 5
+  benchmark: '^STOXX50E'
+
+position_manager:
+  trail_trigger_r: 1.5
+  time_limit_days: 7
+  atr_period: 14
+  stop_proximity_pct: 25
+  atr_buckets:
+    low_threshold_pct: 1.5
+    high_threshold_pct: 3.0
+    low_multiplier: 2.0
+    medium_multiplier: 2.5
+    high_multiplier: 3.0
+
+orders:
+  entry_buffer_pct: 0.5
+  stop_limit_band_pct: 0.4
+
+watchlist:
+  eurostoxx600: true
+  custom: []
+
+notifications:
+  telegram_bot_token: ''
+  telegram_chat_id: ''
+
+logging:
+  log_dir: './logs'
+  sqlite_path: './data/trading.db'
+  retain_days: 90
