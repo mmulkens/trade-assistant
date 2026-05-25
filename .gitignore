@@ -1,0 +1,24 @@
+# Cache
+*.parquet
+cache/
+
+# Logs
+logs/
+
+# Data
+data/*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets / config overrides
+*.local.yaml
