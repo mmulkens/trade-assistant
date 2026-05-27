@@ -11,9 +11,10 @@
 #   - Record position closes and track realised P&L
 #
 # IBKR stubs (Phase 1):
-#   get_portfolio_value() returns the YAML config value.
-#   Daily loss limit checks only cover realised P&L (unrealised requires live
-#   prices from TWS); both will be wired in Phase 2.
+#   _get_portfolio_value() returns the YAML config value (risk.portfolio_value_stub).
+#   Daily loss limit checks only cover realised P&L — unrealised intraday
+#   losses require live pricing from TWS and will be added in Phase 2 when
+#   the IBKR connection is live.
 # ---------------------------------------------------------------------------
 
 from dataclasses import dataclass
@@ -33,13 +34,19 @@ if TYPE_CHECKING:
 
 @dataclass
 class RiskDecision:
+    """Result of running a Signal through all pre-trade risk checks.
+
+    If approved is False, shares is 0 and reject_reason explains why.
+    The Order Executor only proceeds if approved is True.
+    All monetary values are in the portfolio's base currency (EUR).
+    """
     approved: bool
     signal: "Signal"
     shares: int                        # 0 when rejected
     risk_per_share: float              # entry − stop
-    risk_amount: float                 # shares × risk_per_share (currency)
+    risk_amount: float                 # shares × risk_per_share  (EUR)
     position_risk_pct: float           # risk_amount / portfolio_value × 100
-    effective_cap_pct: float           # cap used (reduced for thin instruments)
+    effective_cap_pct: float           # cap that was applied (reduced for thin)
     current_open_risk_pct: float       # total open risk before this trade
     projected_open_risk_pct: float     # total open risk if this trade is taken
     portfolio_value: float             # value used for all calculations
@@ -51,25 +58,25 @@ class RiskDecision:
 # ---------------------------------------------------------------------------
 
 class RiskLayer:
-    """Evaluates signals against portfolio risk constraints.
+    """Pre-trade risk gate: evaluates every Signal before an order is placed.
 
     Typical call sequence per session:
-        1. engine.scan()         → list[Signal]
-        2. risk.evaluate(signal) → RiskDecision  (for each signal)
-        3. order_executor.submit(decision)       (only if approved)
-        4. risk.open_position(decision)          (after fill confirmed)
-        ...later...
-        5. risk.close_position(ticker, price, reason)
+        1.  engine.scan()            → list[Signal]
+        2.  risk.evaluate(signal)    → RiskDecision  (for each signal)
+        3.  order_executor.submit(decision)          (only if decision.approved)
+        4.  risk.open_position(decision)             (after fill confirmed by broker)
+            ...position is now tracked in SQLite...
+        5.  risk.close_position(ticker, price, reason)  (on stop hit / target / trail)
     """
 
     def __init__(self, config: dict, logger: Logger) -> None:
         self._logger = logger
         rl = config["risk"]
-        self._max_position_risk_pct: float = rl["max_position_risk_pct"]
-        self._max_open_risk_pct: float = rl["max_open_risk_pct"]
-        self._daily_loss_limit_pct: float = rl["daily_loss_limit_pct"]
-        self._portfolio_value_stub: float = rl["portfolio_value_stub"]
-        self._thin_size_multiplier: float = rl.get("thin_size_multiplier", 0.5)
+        self._max_position_risk_pct: float = rl["max_position_risk_pct"]   # RL-01: 1.5%
+        self._max_open_risk_pct: float = rl["max_open_risk_pct"]           # RL-02: 6.0%
+        self._daily_loss_limit_pct: float = rl["daily_loss_limit_pct"]     # RL-06: 3.0%
+        self._portfolio_value_stub: float = rl["portfolio_value_stub"]     # Phase 1 stub (RL-04)
+        self._thin_size_multiplier: float = rl.get("thin_size_multiplier", 0.5)  # RL-09
         self._db_path: str = rl["db_path"]
 
     # -----------------------------------------------------------------------
@@ -79,19 +86,23 @@ class RiskLayer:
     def evaluate(self, signal: "Signal") -> RiskDecision:
         """Run all pre-trade checks and return a RiskDecision.
 
-        Checks run in order of cheapness/importance:
-            1. Trading paused (daily loss limit previously triggered today)
-            2. Duplicate instrument
-            3. Daily loss limit (realised P&L only until IBKR wired)
-            4. Position sizing
-            5. Per-trade risk hard cap  (RL-01)
-            6. Total open risk hard cap (RL-02)
+        Checks run in this specific order for a reason:
+            1. Trading paused   — cheapest check; if paused, nothing else matters
+            2. Duplicate        — single DB query; prevents wasted sizing math
+            3. Daily loss limit — computes P&L before sizing; can also set pause
+            4. Position sizing  — pure math; must precede the two cap checks
+            5. Per-trade cap    — hard cap on individual position risk (RL-01)
+            6. Total open risk  — hard cap on aggregate portfolio risk (RL-02)
+
+        The two hard caps (5 and 6) are NEVER overridden.  If either fires,
+        the signal is silently dropped — no human action is required or expected.
         """
         portfolio_value = self._get_portfolio_value()
         current_open_risk_amount = st.get_open_risk_amount(self._db_path)
         current_open_risk_pct = calc.open_risk_pct(current_open_risk_amount, portfolio_value)
 
         def _reject(reason: str) -> RiskDecision:
+            """Build a rejected RiskDecision and log it."""
             self._logger.info({
                 "event": "risk_check_failed",
                 "ticker": signal.ticker,
@@ -113,17 +124,41 @@ class RiskLayer:
                 reject_reason=reason,
             )
 
-        # --- Check 1: trading paused ---
+        # -------------------------------------------------------------------
+        # Check 1 — Trading paused (daily loss limit previously triggered today)
+        #
+        # The pause flag is set as today's date in system_state.  It auto-
+        # expires at midnight — no reset required for a normal next-session
+        # start.  The CLI 'unpause' command clears it manually if needed.
+        # -------------------------------------------------------------------
         if st.is_trading_paused(self._db_path):
             return _reject("trading_paused:daily_loss_limit_reached")
 
-        # --- Check 2: duplicate instrument ---
+        # -------------------------------------------------------------------
+        # Check 2 — Duplicate instrument (RL-07, anti-pyramiding)
+        #
+        # Only one open position per ticker is allowed.  This prevents both
+        # accidental double-entries and deliberate pyramiding (adding to a
+        # winner), which is out of scope for v1.
+        # -------------------------------------------------------------------
         if st.has_open_position(signal.ticker, self._db_path):
             return _reject("duplicate_instrument")
 
-        # --- Check 3: daily loss limit (realised only, Phase 1) ---
+        # -------------------------------------------------------------------
+        # Check 3 — Daily loss limit (RL-06)
+        #
+        # If total realised P&L for today falls below −daily_loss_limit_pct
+        # of portfolio value, pause all new orders for the rest of the session.
+        #
+        # Phase 1 covers only realised losses (positions closed today).
+        # Unrealised intraday drawdown will be added in Phase 2 when live
+        # pricing from IBKR is available.
+        #
+        # Note: daily_loss_pct is negative when the account has lost money,
+        # so we compare against the negative of the limit threshold.
+        # -------------------------------------------------------------------
         daily_pnl = st.get_daily_realized_pnl(self._db_path)
-        daily_loss_pct = (daily_pnl / portfolio_value) * 100  # negative means loss
+        daily_loss_pct = (daily_pnl / portfolio_value) * 100
         if daily_loss_pct < -self._daily_loss_limit_pct:
             st.set_trading_pause(self._db_path)
             self._logger.warning({
@@ -135,7 +170,13 @@ class RiskLayer:
             })
             return _reject("daily_loss_limit_breached")
 
-        # --- Check 4: position sizing ---
+        # -------------------------------------------------------------------
+        # Check 4 — Position sizing (RL-03, RL-09)
+        #
+        # Calculate the number of shares we can buy so that the risk
+        # (entry − stop) × shares stays within the per-trade cap.
+        # Thin instruments receive a reduced cap (RL-09).
+        # -------------------------------------------------------------------
         sizing = calc.size_position(
             entry=signal.entry_price,
             stop=signal.stop_price,
@@ -145,19 +186,40 @@ class RiskLayer:
             thin_size_multiplier=self._thin_size_multiplier,
         )
 
+        # shares == 0 means risk_per_share is larger than the entire risk budget
+        # (extremely wide stop relative to portfolio size).  Cannot size.
         if sizing.shares == 0:
             return _reject("zero_shares:risk_per_share_too_large_or_invalid_prices")
 
-        # --- Check 5: per-trade hard cap (RL-01) ---
-        # floor() guarantees we never exceed the cap, but we verify explicitly
-        # because this rule must never be overridden.
+        # -------------------------------------------------------------------
+        # Check 5 — Per-trade hard cap (RL-01): max 1.5% per trade
+        #
+        # floor() in size_position() mathematically guarantees we cannot
+        # exceed the cap.  This explicit check acts as a safety net against
+        # any future changes to size_position() that might inadvertently
+        # produce oversized results.  The 0.001% tolerance covers floating-
+        # point rounding in the final percentage calculation.
+        #
+        # This rule is NEVER overridden — it is the outermost guard on
+        # individual position risk.
+        # -------------------------------------------------------------------
         if sizing.position_risk_pct > self._max_position_risk_pct + 0.001:
             return _reject(
                 f"position_risk_cap_exceeded:"
                 f"{sizing.position_risk_pct:.3f}pct_vs_limit_{self._max_position_risk_pct}pct"
             )
 
-        # --- Check 6: total open risk hard cap (RL-02) ---
+        # -------------------------------------------------------------------
+        # Check 6 — Total open risk hard cap (RL-02): max 6% across all trades
+        #
+        # Projects what total open risk would be if this trade is added.
+        # If it would push the aggregate over 6%, the signal is dropped even
+        # though it would be valid on its own.  When this cap is hit, the
+        # session is considered "fully invested" from a risk perspective —
+        # new signals should wait for existing positions to be closed.
+        #
+        # This rule is NEVER overridden.
+        # -------------------------------------------------------------------
         projected_open_risk_pct = calc.open_risk_pct(
             current_open_risk_amount + sizing.risk_amount, portfolio_value
         )
@@ -167,6 +229,7 @@ class RiskLayer:
                 f"projected_{projected_open_risk_pct:.3f}pct_vs_limit_{self._max_open_risk_pct}pct"
             )
 
+        # --- All checks passed ---
         self._logger.info({
             "event": "risk_check_passed",
             "ticker": signal.ticker,
@@ -201,8 +264,12 @@ class RiskLayer:
     def open_position(self, decision: RiskDecision) -> int:
         """Persist an approved trade to the state store after the order fills.
 
-        Returns the row id of the new position record.
-        Must only be called after Order Executor confirms a fill.
+        Must only be called after Order Executor confirms a fill — not on
+        approval.  An approved signal may fail to fill (session closes,
+        order rejected by broker, etc.), and recording it prematurely would
+        inflate the open risk count and block subsequent valid signals.
+
+        Returns the row id of the new risk_positions record.
         """
         sig = decision.signal
         row_id = st.add_position(
@@ -234,10 +301,14 @@ class RiskLayer:
         return row_id
 
     def close_position(self, ticker: str, close_price: float, reason: str) -> bool:
-        """Record a position close and realised P&L.
+        """Record a position close and calculate realised P&L.
 
+        `reason` must be one of: 'stop' | 'target' | 'trail' | 'manual'.
         Returns True if a matching open position was found and updated.
-        `reason` is one of: 'stop' | 'target' | 'trail' | 'manual'.
+        Returns False (with a warning log) if no open position existed.
+
+        After a close, the realised P&L feeds into get_daily_realized_pnl()
+        which is used by Check 3 (daily loss limit) on the next evaluate() call.
         """
         updated = st.close_position(ticker, close_price, reason, self._db_path)
         if updated:
@@ -257,7 +328,11 @@ class RiskLayer:
         return updated
 
     def get_open_risk_summary(self) -> dict:
-        """Return a dict summarising current open exposure (for logging/display)."""
+        """Return a dict summarising current open exposure.
+
+        Used by the CLI status command and for session-start logging.
+        All monetary values are in the portfolio's base currency (EUR).
+        """
         portfolio_value = self._get_portfolio_value()
         open_positions = st.get_open_positions(self._db_path)
         total_risk_amount = sum(p["risk_amount"] for p in open_positions)
@@ -287,10 +362,14 @@ class RiskLayer:
     # -----------------------------------------------------------------------
 
     def _get_portfolio_value(self) -> float:
-        """Return portfolio value for sizing calculations.
+        """Return the portfolio value used for all position sizing calculations.
 
-        Phase 1: returns the stub value from config.yaml (risk.portfolio_value_stub).
-        Phase 2: will call IBKR TWS API reqAccountSummary to get live net liquidation
-                 value (RL-04).
+        Phase 1 — stub: returns risk.portfolio_value_stub from config.yaml.
+        Phase 2 — live: will call IBKR TWS API reqAccountSummary to retrieve
+            the account's net liquidation value in real time (RL-04).
+
+        The net liquidation value (cash + market value of open positions) is the
+        correct base for risk % calculations because it reflects what the account
+        is actually worth at any given moment, not just the starting cash balance.
         """
         return self._portfolio_value_stub

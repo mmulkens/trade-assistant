@@ -54,8 +54,11 @@ class Signal:
     signal_timestamp: datetime  # UTC timestamp of signal generation
     earnings_flag: Optional[bool]   # True = binary event within N days; None = stub
 
-    # --- Stop quality flag ---
+    # --- Stop quality flag and component breakdown ---
     stop_capped: bool           # True when stop_hard_cap_pct was applied
+    swing_low_stop: float       # Structural stop: min low of last swing_low_period bars
+    atr_stop: float             # ATR floor: entry − stop_atr_multiplier × ATR14
+    stop_method: str            # Which component set the final stop: 'swing_low' | 'atr_floor' | 'hard_cap'
 
     # --- Annotation fields (logged and stored, not part of the Risk Layer contract) ---
     strategy_a_fired: bool      # Did EMA Pullback fire?
@@ -281,16 +284,18 @@ class SignalEngine:
         #         If the swing low is closer to entry than 1.5×ATR, the stop
         #         is too tight and will be triggered by normal intraday noise.
         #         Taking the lower (wider) of the two gives the trade breathing room.
-        atr_val  = float(atr_series.iloc[-1])
-        atr_stop = entry - self._stop_atr_mult * atr_val
-        stop = min(swing_low, atr_stop)
+        atr_val      = float(atr_series.iloc[-1])
+        atr_stop_val = entry - self._stop_atr_mult * atr_val
+        stop = min(swing_low, atr_stop_val)
+        stop_method  = "swing_low" if swing_low <= atr_stop_val else "atr_floor"
 
         # Step 3: hard cap — never risk more than stop_hard_cap_pct of entry.
         #         Prevents extreme stops on volatile or thinly traded names.
-        max_risk   = entry * (self._stop_hard_cap_pct / 100)
+        max_risk    = entry * (self._stop_hard_cap_pct / 100)
         stop_capped = (entry - stop) > max_risk
         if stop_capped:
-            stop = entry - max_risk
+            stop        = entry - max_risk
+            stop_method = "hard_cap"
         stop = round(stop, 4)
 
         risk   = entry - stop
@@ -328,6 +333,9 @@ class SignalEngine:
             signal_timestamp=datetime.now(timezone.utc),
             earnings_flag=None,
             stop_capped=stop_capped,
+            swing_low_stop=round(swing_low, 4),
+            atr_stop=round(atr_stop_val, 4),
+            stop_method=stop_method,
             strategy_a_fired=a_fired,
             strategy_b_fired=b_fired,
             near_52wk_high=near_52wk,
@@ -342,6 +350,9 @@ class SignalEngine:
             "conviction": conviction,
             "entry": signal.entry_price,
             "stop": signal.stop_price,
+            "stop_method": stop_method,
+            "swing_low_stop": signal.swing_low_stop,
+            "atr_stop": signal.atr_stop,
             "target": signal.target_price,
             "risk_pct": round((entry - stop) / entry * 100, 2),
             "stop_capped": stop_capped,

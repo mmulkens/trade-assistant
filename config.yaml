@@ -17,6 +17,14 @@ risk:
   daily_loss_limit_pct: 3.0     # If the portfolio loses this % in a single day, halt all
                                  # new orders for the remainder of the session
 
+  # Phase 1 stub — replaced by IBKR reqAccountSummary (net liquidation value) in Phase 2
+  portfolio_value_stub: 100000.0  # Portfolio value used for all sizing until IBKR is wired (RL-04)
+
+  thin_size_multiplier: 0.5     # Thin instruments receive this fraction of the standard position
+                                 # size (RL-09) — 0.5 = half size for names with low liquidity
+
+  db_path: './data/risk.db'     # SQLite database for open positions, realised P&L, system state
+
 
 # -----------------------------------------------------------------------------
 # Transaction costs (used by Order Executor for R:R validation)

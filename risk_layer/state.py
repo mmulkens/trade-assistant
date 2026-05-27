@@ -1,13 +1,27 @@
 # ---------------------------------------------------------------------------
 # state.py — SQLite persistence for the Risk Layer
 #
+# Why SQLite (not a flat file)?
+#   The Risk Layer needs to survive process restarts.  If the bot crashes and
+#   restarts mid-session, it must still know which positions are open and how
+#   much risk is already committed — otherwise it could open duplicate trades
+#   or breach the 6% hard cap without realising it.  SQLite gives us atomic
+#   writes, queryable history, and a zero-dependency file-based store.
+#
 # Two tables:
-#   risk_positions  — one row per trade, status 'open' or 'closed'
-#   system_state    — key/value store for flags (e.g. trading_paused_date)
+#   risk_positions  — one row per trade; status 'open' or 'closed'
+#   system_state    — key/value store for persistent flags (e.g. trading pause)
+#
+# The pause flag uses a date-scoped approach: the value stored is the date on
+# which the pause was triggered.  If that date is today, trading is paused.
+# If today is a new calendar day, the flag is automatically stale and is
+# treated as "not paused" — no cron job or explicit reset is needed for the
+# normal case (though the CLI offers 'unpause' for manual overrides).
 #
 # Schema migration follows the same forward-only pattern as signal_engine/db.py:
 # init_db() adds any columns present in _COLUMNS but missing from an older
-# on-disk table via ALTER TABLE ADD COLUMN.
+# on-disk table via ALTER TABLE ADD COLUMN, so existing data is preserved
+# across schema updates without destructive migrations.
 # ---------------------------------------------------------------------------
 
 import sqlite3
@@ -28,20 +42,21 @@ _POSITION_COLUMNS: list[tuple[str, str]] = [
     ("stop_price",              "REAL    NOT NULL"),
     ("shares",                  "INTEGER NOT NULL"),
     ("risk_per_share",          "REAL    NOT NULL"),
-    ("risk_amount",             "REAL    NOT NULL"),
-    ("position_risk_pct",       "REAL    NOT NULL"),
-    ("portfolio_value_at_open", "REAL    NOT NULL"),
-    ("liquidity_class",         "TEXT"),
-    ("signal_type",             "TEXT"),
-    ("conviction",              "TEXT"),
-    ("status",                  "TEXT    NOT NULL"),   # 'open' | 'closed'
-    ("opened_at",               "TEXT    NOT NULL"),   # ISO-8601 UTC
+    ("risk_amount",             "REAL    NOT NULL"),    # shares × risk_per_share
+    ("position_risk_pct",       "REAL    NOT NULL"),    # risk_amount / portfolio_value × 100
+    ("portfolio_value_at_open", "REAL    NOT NULL"),    # snapshot used for sizing
+    ("liquidity_class",         "TEXT"),                # 'liquid' | 'thin'
+    ("signal_type",             "TEXT"),                # 'pullback' | 'breakout' | 'pullback+breakout'
+    ("conviction",              "TEXT"),                # 'standard' | 'elevated'
+    ("status",                  "TEXT    NOT NULL"),    # 'open' | 'closed'
+    ("opened_at",               "TEXT    NOT NULL"),    # ISO-8601 UTC
     ("closed_at",               "TEXT"),
     ("close_price",             "REAL"),
     ("realized_pnl",            "REAL"),
-    ("close_reason",            "TEXT"),               # 'stop' | 'target' | 'trail' | 'manual'
+    ("close_reason",            "TEXT"),                # 'stop' | 'target' | 'trail' | 'manual'
 ]
 
+# Columns without a PRIMARY KEY constraint can be added by forward migration
 _MIGRATABLE_POSITION_COLS = [c for c in _POSITION_COLUMNS if "PRIMARY KEY" not in c[1]]
 
 _CREATE_POSITIONS = (
@@ -50,6 +65,7 @@ _CREATE_POSITIONS = (
     + "\n)"
 )
 
+# Key/value store for session-level flags.  Values are always TEXT.
 _CREATE_SYSTEM_STATE = """
 CREATE TABLE IF NOT EXISTS system_state (
     key   TEXT PRIMARY KEY,
@@ -67,25 +83,34 @@ INSERT INTO risk_positions (
 
 
 # ---------------------------------------------------------------------------
-# Public functions
+# Initialisation
 # ---------------------------------------------------------------------------
 
 def init_db(db_path: str) -> None:
     """Create tables if absent; add any new columns to existing tables.
 
-    Safe to call on every startup.
+    Safe to call on every startup — idempotent.  New columns added to
+    _POSITION_COLUMNS in future schema versions are automatically added to
+    an existing on-disk table without touching any existing data.
     """
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
         conn.execute(_CREATE_POSITIONS)
         conn.execute(_CREATE_SYSTEM_STATE)
 
+        # Forward migration: add any column in the schema but not yet on disk
         existing = {row[1] for row in conn.execute("PRAGMA table_info(risk_positions)")}
         for name, sql_type in _MIGRATABLE_POSITION_COLS:
             if name not in existing:
+                # ALTER TABLE ADD COLUMN does not support NOT NULL or defaults in SQLite;
+                # strip to bare type — new rows get NULL for the added column
                 base_type = sql_type.split()[0]
                 conn.execute(f"ALTER TABLE risk_positions ADD COLUMN {name} {base_type}")
 
+
+# ---------------------------------------------------------------------------
+# Position write operations
+# ---------------------------------------------------------------------------
 
 def add_position(
     ticker: str,
@@ -102,7 +127,12 @@ def add_position(
     conviction: str,
     db_path: str,
 ) -> int:
-    """Insert a new open position. Returns the new row id."""
+    """Insert a new open position. Returns the new row id.
+
+    Called by RiskLayer.open_position() after the Order Executor confirms
+    a fill — not on signal approval, because an approved signal may still
+    fail to fill (order rejected, session closed, etc.).
+    """
     opened_at = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(db_path) as conn:
         cur = conn.execute(
@@ -123,10 +153,20 @@ def close_position(
     reason: str,
     db_path: str,
 ) -> bool:
-    """Mark the open position for `ticker` as closed and record realized P&L.
+    """Mark the most recent open position for `ticker` as closed.
 
-    P&L = (close_price - entry_price) × shares.
-    Returns True if a row was updated, False if no open position was found.
+    Calculates and stores realised P&L = (close_price − entry_price) × shares.
+    A negative value is a loss.
+
+    Returns True if a matching open position was found and updated.
+    Returns False if no open position exists for this ticker — the caller
+    (RiskLayer.close_position) logs a warning in that case.
+
+    Why ORDER BY opened_at DESC LIMIT 1?
+        Under normal operation there is only one open position per ticker
+        (the duplicate check in evaluate() prevents pyramiding).  The ORDER BY
+        is a safety net in case state is corrected manually and a second row
+        somehow exists — we always close the most recently opened one.
     """
     closed_at = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(db_path) as conn:
@@ -151,8 +191,12 @@ def close_position(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Position read operations
+# ---------------------------------------------------------------------------
+
 def get_open_positions(db_path: str) -> list[dict]:
-    """Return all open positions as a list of dicts."""
+    """Return all open positions as a list of dicts (one per row)."""
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -162,7 +206,11 @@ def get_open_positions(db_path: str) -> list[dict]:
 
 
 def get_open_risk_amount(db_path: str) -> float:
-    """Sum of risk_amount across all open positions."""
+    """Sum of risk_amount across all open positions (in portfolio currency).
+
+    This is the key input to the RL-02 total open risk check.
+    COALESCE(…, 0.0) ensures we get 0 rather than NULL when no rows exist.
+    """
     with sqlite3.connect(db_path) as conn:
         result = conn.execute(
             "SELECT COALESCE(SUM(risk_amount), 0.0) FROM risk_positions WHERE status = 'open'"
@@ -171,7 +219,11 @@ def get_open_risk_amount(db_path: str) -> float:
 
 
 def has_open_position(ticker: str, db_path: str) -> bool:
-    """Return True if there is already an open position for this ticker."""
+    """Return True if there is already an open position for this ticker (RL-07).
+
+    Used to enforce the duplicate / anti-pyramiding check before accepting
+    a new signal.  A stock that is already held cannot be entered again.
+    """
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
             "SELECT 1 FROM risk_positions WHERE ticker = ? AND status = 'open' LIMIT 1",
@@ -181,7 +233,16 @@ def has_open_position(ticker: str, db_path: str) -> bool:
 
 
 def get_daily_realized_pnl(db_path: str, for_date: Optional[date] = None) -> float:
-    """Sum of realized P&L for positions closed on `for_date` (defaults to today)."""
+    """Sum of realised P&L for all positions closed on `for_date` (default: today).
+
+    Used to enforce the daily loss limit (RL-06).
+
+    Phase 1 limitation: this only covers realised P&L from positions that
+    were fully closed today.  Unrealised intraday losses on open positions
+    are not captured until IBKR live pricing is wired up.  The Phase 1
+    implementation is conservative — it can only trigger a pause after
+    a loss is locked in, not preemptively.
+    """
     target = (for_date or date.today()).isoformat()
     with sqlite3.connect(db_path) as conn:
         result = conn.execute(
@@ -193,14 +254,19 @@ def get_daily_realized_pnl(db_path: str, for_date: Optional[date] = None) -> flo
 
 
 # ---------------------------------------------------------------------------
-# Trading pause (RL-06)
+# Trading pause (RL-06 — daily loss limit)
 # ---------------------------------------------------------------------------
 
 _PAUSE_KEY = "trading_paused_date"
 
 
 def is_trading_paused(db_path: str) -> bool:
-    """Return True if a pause was set today (daily loss limit reached)."""
+    """Return True if the daily loss limit was triggered today.
+
+    The pause value is the ISO date on which the limit was breached.
+    Comparing against today means the pause automatically expires at midnight
+    — the next session starts fresh with no manual intervention required.
+    """
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
             "SELECT value FROM system_state WHERE key = ?", (_PAUSE_KEY,)
@@ -211,7 +277,13 @@ def is_trading_paused(db_path: str) -> bool:
 
 
 def set_trading_pause(db_path: str) -> None:
-    """Record today's date as the pause trigger date."""
+    """Record today's date as the pause trigger date.
+
+    ON CONFLICT DO UPDATE (UPSERT) is used instead of INSERT + UPDATE because:
+    - If no pause row exists yet, we need to INSERT.
+    - If a pause was already set earlier today (e.g. the limit function is
+      called twice in the same session), we update in-place rather than error.
+    """
     today = date.today().isoformat()
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -222,6 +294,11 @@ def set_trading_pause(db_path: str) -> None:
 
 
 def clear_trading_pause(db_path: str) -> None:
-    """Remove the pause flag (call at session start or manually via CLI)."""
+    """Remove the pause flag entirely.
+
+    Used by the CLI 'unpause' command to override the daily loss limit
+    manually — for example, if the loss was caused by a data error or a
+    position that was manually corrected in the broker account.
+    """
     with sqlite3.connect(db_path) as conn:
         conn.execute("DELETE FROM system_state WHERE key = ?", (_PAUSE_KEY,))

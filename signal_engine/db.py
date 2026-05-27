@@ -48,6 +48,9 @@ _COLUMNS: list[tuple[str, str, str]] = [
     ("conviction",          "TEXT",               "'standard' | 'elevated'"),
     ("earnings_flag",       "INTEGER",            "1 = binary event imminent; NULL = unknown (stub)"),
     ("stop_capped",         "INTEGER",            "1 when hard cap was applied to the stop distance"),
+    ("swing_low_stop",      "REAL",               "structural stop: min low of last swing_low_period bars"),
+    ("atr_stop",            "REAL",               "ATR floor: entry − stop_atr_multiplier × ATR14"),
+    ("stop_method",         "TEXT",               "'swing_low' | 'atr_floor' | 'hard_cap' — which component set the final stop"),
     ("strategy_a_fired",    "INTEGER",            "1 if EMA Pullback strategy triggered"),
     ("strategy_b_fired",    "INTEGER",            "1 if Breakout strategy triggered"),
     ("near_52wk_high",      "INTEGER",            "1 if price within near_52wk_high_pct% of 52-wk high"),
@@ -73,9 +76,10 @@ INSERT INTO signals (
     signal_timestamp, ticker, instrument_id, direction,
     entry_price, stop_price, target_price, signal_type,
     liquidity_class, conviction, earnings_flag, stop_capped,
+    swing_low_stop, atr_stop, stop_method,
     strategy_a_fired, strategy_b_fired, near_52wk_high,
     market_regime, rs_value
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 # ---------------------------------------------------------------------------
@@ -129,6 +133,9 @@ def save_signals(signals: list["Signal"], db_path: str) -> int:
             s.conviction,
             None if s.earnings_flag is None else int(s.earnings_flag),
             int(s.stop_capped),
+            s.swing_low_stop,
+            s.atr_stop,
+            s.stop_method,
             int(s.strategy_a_fired),
             int(s.strategy_b_fired),
             int(s.near_52wk_high),
