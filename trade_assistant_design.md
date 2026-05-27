@@ -703,6 +703,7 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | RL-07 | Risk Layer | Prevent unintentional pyramiding — duplicate instrument check | Must |
 | RL-08 | Risk Layer | Monitor sector/correlation exposure across open positions | Should |
 | RL-09 | Risk Layer | Apply smaller position sizing for thin/illiquid instruments | Should |
+| RL-10 | Risk Layer | Recalculate and update `risk_amount` for an open position whenever the Position Manager reports a stop update; once the active stop is at or above entry + costs, that position contributes zero to the open risk budget (RL-02) | Must |
 
 ### Order Executor
 
@@ -741,6 +742,7 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | PM-13 | Position Manager | Log all time exit evaluations with conditions checked, decision, and rationale | Must |
 | PM-14 | Position Manager | Notify on trail trigger, significant trail updates, and time exit decisions | Must |
 | PM-15 | Position Manager | All multipliers and time limit configurable in YAML config | Must |
+| PM-16 | Position Manager | Notify the Risk Layer whenever the active stop is updated, passing ticker and new stop level so the Risk Layer can recalculate the live risk amount for that position (see RL-10) | Must |
 
 ### Market Data
 
