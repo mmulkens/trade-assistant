@@ -195,7 +195,60 @@ MACD is not a standalone strategy — it is an internal confirmation layer withi
 | Shorting individual stocks | Unlimited loss risk; short squeezes violent in smaller EU stocks. Phase 4+ consideration. |
 | Dual Momentum ETF rotation | Monthly rebalance incompatible with swing trading. Valid as separate 30–40% portfolio sleeve — not mixed in. |
 
-### G. Future — Strategy C (AVWAP)
+### H. Intraday Breakout Confirmation (Strategy B only)
+
+**Problem:** the EOD signal engine fires on the prior day's close. If a breakout stock gaps up at the open and never pulls back to yesterday's close, the Order Executor cannot enter at a viable R:R using a resting limit. High-conviction breakouts running hard early would be missed entirely.
+
+**Decision: scheduled intraday runs at 13:30, 14:30, and 15:30 (local exchange time), targeting Strategy B only.**
+
+The intraday runs do not replace the EOD run — they complement it. The EOD run fires at market open (or pre-market) on EOD data and places resting limit orders for pullback signals. The intraday runs catch breakouts developing during the session and enter with a marketable limit at the current ask.
+
+**What each intraday run evaluates (Strategy B conditions only):**
+
+- EMA chain alignment and market regime: sourced from the Parquet cache (daily calculations — unchanged intraday)
+- Price condition: `current live price > 50-day highest high` — evaluated against the IBKR real-time feed
+- Volume confirmation: intraday volume extrapolated to full-session equivalent and checked against 1.5× 20-day average volume
+- MACD: trusted from EOD data — partial-day MACD is too noisy to recalculate reliably intraday
+- R:R: re-validated from scratch against the live ask price at the moment of each run
+
+**Volume extrapolation:**
+```python
+session_minutes_total = 510          # Euronext: 09:00–17:30
+elapsed_minutes = now - market_open
+extrapolated_volume = intraday_volume * (session_minutes_total / elapsed_minutes)
+confirmed = extrapolated_volume >= volume_multiplier * avg_20d_volume
+```
+
+**Stricter volume multipliers for earlier runs** (less session elapsed = more extrapolation uncertainty):
+
+| Run time | Volume multiplier | Session elapsed (approx.) |
+|---|---|---|
+| 13:30 | 1.8× | ~55% |
+| 14:30 | 1.6× | ~67% |
+| 15:30 | 1.5× | ~78% (standard) |
+
+**R:R gate is always hard — never relaxed for intraday runs.** A breakout that has already moved so far that R:R is compressed is a worse trade regardless of conviction level. The three runs provide multiple opportunities to catch the signal at a viable price; if none of them produce a valid R:R, the trade is correctly skipped.
+
+**Intraday deduplication — three layers:**
+
+1. Open position check (Risk Layer): if the ticker already has an open position, skip.
+2. Pending order check: if the ticker already has a live unconfirmed order from any earlier run today, skip.
+3. Session rejection store: if the ticker was evaluated and **rejected for compressed R:R** in any earlier intraday run today, it is added to an in-memory `intraday_rejections` store and skipped in all subsequent runs for the remainder of the session.
+
+The session rejection store is in-memory only and resets at the start of each trading day. It exists to prevent a "gap-and-crap" scenario: a stock that spiked at open (compressing R:R at 13:30), then partially faded (appearing to recover at 15:30), is not a clean setup and should not be re-evaluated.
+
+Note: tickers that fail the **price condition** (no longer above the 50-day high) at a given run time are NOT added to the rejection store — a fresh, clean breakout developing later in the session is a legitimate new signal.
+
+**EOD self-deduplication via freshness check:** if an intraday run results in a fill on day N, the EOD run on day N+1 will see that yesterday's close was already above the 50-day high and the existing Strategy B freshness check will suppress the signal naturally. No additional logic required.
+
+**What changes in the codebase:**
+- `signal_engine`: add `intraday_mode` flag — runs Strategy B only, accepts live price and intraday volume as inputs, skips all EOD-only indicator recalculation
+- Scheduler: add three jobs at 13:30, 14:30, 15:30 calling the engine in `intraday_mode`
+- Order Executor: no changes — receives a Signal object regardless of which run produced it
+- Signal payload: add `run_type` field (`eod` | `intraday`) for logging and audit purposes
+- In-memory `intraday_rejections` store: keyed by ticker, scoped to trading session
+
+### I. Future — Strategy C (AVWAP)
 
 Anchored VWAP bounce strategy designed but deferred from Phase 1.
 
@@ -558,6 +611,8 @@ All fields required before the Order Executor will proceed:
 | conviction | str | 'standard' or 'elevated' (both strategies fired, or near 52wk high) |
 | signal_timestamp | datetime | UTC timestamp when signal was generated |
 | earnings_flag | bool\|None | True if binary event within N days; None if unknown |
+| run_type | str | 'eod' or 'intraday' — which engine run produced this signal |
+| reference_price | float | EOD closing price used to calculate stop/target (may differ from entry_price on intraday runs) |
 
 ### B. Watchlist
 
@@ -608,6 +663,13 @@ signal_engine:
   breakout_period: 50
   near_52wk_high_pct: 5
   benchmark: '^STOXX50E'
+  intraday_runs:
+    - time: "13:30"
+      volume_multiplier: 1.8
+    - time: "14:30"
+      volume_multiplier: 1.6
+    - time: "15:30"
+      volume_multiplier: 1.5
 
 position_manager:
   trail_trigger_r: 1.5
@@ -689,6 +751,16 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | SE-11 | Signal Engine | Log every signal fired with full parameters, indicator values, and conviction level | Must |
 | SE-12 | Signal Engine | Log every signal skipped with reason | Must |
 | SE-13 | Signal Engine | Support Eurostoxx 600 universe + custom fixed list as watchlist sources | Must |
+| SE-14 | Signal Engine | Run scheduled intraday scans at 13:30, 14:30, and 15:30 (local exchange time) for Strategy B only | Must |
+| SE-15 | Signal Engine | Intraday mode: evaluate price condition against IBKR live price; extrapolate intraday volume to full-session equivalent | Must |
+| SE-16 | Signal Engine | Intraday mode: apply per-run volume multipliers (13:30 → 1.8×, 14:30 → 1.6×, 15:30 → 1.5×) configurable in YAML | Must |
+| SE-17 | Signal Engine | Intraday mode: reuse EMA chain, MACD, and market regime from EOD Parquet data — do not recalculate from partial intraday bars | Must |
+| SE-18 | Signal Engine | Intraday mode: re-validate R:R from scratch against live ask price at run time — R:R gate is never relaxed | Must |
+| SE-19 | Signal Engine | Maintain in-memory session rejection store: tickers rejected for compressed R:R in any intraday run are skipped in all subsequent intraday runs that session | Must |
+| SE-20 | Signal Engine | Intraday deduplication: skip tickers with an open position, a pending order, or an entry in the session rejection store | Must |
+| SE-21 | Signal Engine | Tickers that fail the price condition intraday (no longer above 50-day high) are NOT added to the rejection store — a clean breakout later in the session is a fresh signal | Must |
+| SE-22 | Signal Engine | Add `run_type` field ('eod' \| 'intraday') to signal payload; add `reference_price` field (EOD close used for stop/target calculation) | Must |
+| SE-23 | Signal Engine | Log intraday run results: tickers evaluated, skipped (with reason), signals fired, rejection store additions | Must |
 
 ### Risk Layer
 
@@ -767,6 +839,7 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | NL-07 | Notifications | Notify on any pause condition triggered | Must |
 | NL-08 | Notifications | Use emoji-prefixed structured format for quick mobile scanning | Should |
 | NL-09 | Notifications | Notifications are informational only — no action required under normal operation | Must |
+| NL-10 | Notifications | Notify on intraday signal fired: include run time, live entry price, R:R, and volume confirmation ratio | Should |
 
 ### Logging & Analytics
 
