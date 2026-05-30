@@ -18,9 +18,10 @@
 10. [Design Consideration 9 — Asset Scope](#10-design-consideration-9--asset-scope)
 11. [Design Consideration 10 — Position Manager](#11-design-consideration-10--position-manager)
 12. [Design Consideration 11 — Logging & Analytics](#12-design-consideration-11--logging--analytics)
-13. [Pre-Build Decisions & System Parameters](#13-pre-build-decisions--system-parameters)
-14. [IBKR API — Preliminary Notes](#14-ibkr-api--preliminary-notes)
-15. [Functional Requirements](#15-functional-requirements)
+13. [Design Consideration 12 — Reporting](#13-design-consideration-12--reporting)
+14. [Pre-Build Decisions & System Parameters](#14-pre-build-decisions--system-parameters)
+15. [IBKR API — Preliminary Notes](#15-ibkr-api--preliminary-notes)
+16. [Functional Requirements](#16-functional-requirements)
 
 ---
 
@@ -45,9 +46,11 @@ Trade Assistant
     │         ├── Marketable limit orders
     │         └── Stop / target management
     │
-    ├── Position Manager     → ATR trail, cost floor, time-based exits
+    ├── Position Manager     → ATR trail, cost floor, time-based exits, manual exit detection
     │
     ├── Logging Layer        → JSON lines + SQLite analytics DB
+    │
+    ├── Report Generator     → per-trade diary, portfolio summary, annual tax export
     │
     └── Notification Layer   → Telegram
 ```
@@ -486,14 +489,15 @@ A separate IBKR account opened solely for the automated bot. Existing Mexem acco
 
 ## 11. Design Consideration 10 — Position Manager
 
-The position manager handles all post-entry trade management: ATR trail calculation, stop updates via API, time-based exit evaluation, and profit protection.
+The position manager handles all post-entry trade management: ATR trail calculation, stop updates via API, time-based exit evaluation, profit protection, and manual exit detection.
 
 ### A. Exit Philosophy
 
 - No partial closes — entire position managed as single unit
 - Initial target (1:2 R:R) is the minimum expectation, not a ceiling
 - Goal: capture extended moves (1:5+) while protecting accumulated profit
-- The stop is the only exit mechanism — initial stop, cost floor, or ATR trail
+- The stop is the only planned exit mechanism — initial stop, cost floor, or ATR trail
+- Manual exits by the user are detected and recorded as a distinct exit type
 
 ### B. Trail Trigger & Stop Floor
 
@@ -543,20 +547,53 @@ Time exit only fires when: signal queue non-empty **AND** open risk ≥ 6%.
 
 > The time exit targets stalled positions consuming capital needed elsewhere. The stop remains the primary invalidation signal for all positions.
 
-### E. Combined Decision Tree
+### E. Manual Exit Handling
+
+Manual exits occur when the user closes a position directly via the IBKR platform, bypassing the bot. The position manager must detect and record these cleanly.
+
+**Detection — primary mechanism (automatic):**
+`ib_insync` fires position change events whenever the IBKR account state changes. The position manager listens for position close events, compares against its own open position state, and if a position closes without a bot-initiated order, records it as `exit_reason: manual`.
+
+**Detection — fallback (CLI):**
+```
+python -m position_manager close ASML.AS 72.50 manual
+```
+Used if the automatic detection misses an edge case (e.g. corporate action, Gateway was offline when the close occurred).
+
+**What is logged on manual exit:**
+- `exit_reason: manual`
+- `bot_initiated: false`
+- Exit price from the IBKR fill report (actual price)
+- Exchange fill timestamp
+- P&L calculated from actual fill vs entry price
+- Optional free-text note field for the trading diary (e.g. "closed early — earnings risk")
+
+**Valid exit reasons (structured field across all exit types):**
+
+| Exit Reason | Initiated By | Description |
+|---|---|---|
+| `trail_hit` | Bot | ATR trailing stop was triggered |
+| `stop_hit` | Bot | Initial or breakeven stop was triggered |
+| `time_exit` | Bot | Time-based exit conditions were met |
+| `manual` | User | Position closed directly via IBKR platform |
+
+> The trading diary distinguishes bot-managed exits from manual overrides. The tax report treats all exit types equally — only the financial data matters.
+
+### F. Combined Decision Tree
 
 ```
 Position open
     ├── Price hits 1:1.5 R
     │       ├── Stop → entry + costs (cost floor)
     │       └── ATR trail begins from running high
-    │               └── Trail stop hit → close entire position
+    │               └── Trail stop hit → close entire position (exit_reason: trail_hit)
     ├── Time limit reached, trail NOT active
     │       ├── Signal queue empty OR open risk < 6% → hold
     │       └── Signal queue non-empty AND open risk ≥ 6%
-    │               ├── Within 20–30% of stop → close
+    │               ├── Within 20–30% of stop → close (exit_reason: time_exit)
     │               └── Otherwise → hold, stop manages exit
-    └── Stop hit at any point → close entire position
+    ├── Stop hit at any point → close entire position (exit_reason: stop_hit)
+    └── Position closed externally → detect + log (exit_reason: manual)
 ```
 
 ---
@@ -568,10 +605,10 @@ Logging is a first-class component. Every decision has financial consequences �
 | Component | Events & Calculations Logged |
 |---|---|
 | Data Fetcher | Fetch initiated · Ticker errors/retries · Cache hits vs misses · Delta rows appended · Full refresh triggered |
-| Signal Engine | Signal fired (all parameters, conviction) · Signal skipped (reason) · Indicator values at signal time |
-| Risk Layer | Pre-trade check (portfolio value, size, open risk, pass/fail) · Hard rule triggered |
-| Order Executor | Order submitted · Order filled · Order cancelled · R:R validation inputs and result |
-| Position Manager | Trail triggered · Trail updated · Time limit evaluation · Position closed (reason, P&L) |
+| Signal Engine | Signal fired (all parameters, conviction) · Signal skipped (reason) · Indicator values at signal time · Intraday run results |
+| Risk Layer | Pre-trade check (portfolio value, size, open risk, pass/fail) · Hard rule triggered · Stop update received from Position Manager (RL-10) |
+| Order Executor | Order submitted · Order filled (actual price, actual costs from IBKR) · Order cancelled · R:R validation inputs and result |
+| Position Manager | Trail triggered · Trail updated · Time limit evaluation · Position closed (exit_reason, bot_initiated, P&L, note) |
 | Market Data | Feed interruption · Liquidity check result · Earnings flag |
 | Notifications | Every notification (type, content, delivery status) |
 | System | Gateway connected/disconnected · Bot started/stopped · Daily loss limit status |
@@ -582,6 +619,7 @@ Logging is a first-class component. Every decision has financial consequences �
 SELECT * FROM skipped_trades WHERE date > '2026-05-01' AND reason = 'insufficient_rr';
 SELECT instrument, avg(fill_slippage) FROM fills GROUP BY instrument;
 SELECT instrument, trail_trigger_price, close_price, pnl FROM position_manager_log;
+SELECT exit_reason, count(*) FROM closed_positions GROUP BY exit_reason;
 ```
 
 ```
@@ -592,7 +630,61 @@ Your laptop  →  SSH tunnel (encrypted, port 22)  →  Cloud server  →  SQLit
 
 ---
 
-## 13. Pre-Build Decisions & System Parameters
+## 13. Design Consideration 12 — Reporting
+
+The report generator is a separate, on-demand module that reads from the SQLite database and produces human-readable outputs. It serves two distinct purposes: a trading diary for performance review, and a tax export for annual compliance.
+
+### A. Trading Diary (Per-Trade Reports)
+
+Inspired by Alexander Elder's trade journal methodology. For each closed position, a structured report is generated covering both the financial outcome and the trade narrative.
+
+**Report contents per trade:**
+
+- **Price chart** with annotated entry, initial stop, cost-floor level, target, trail stop progression, and exit point
+- **Signal metadata:** strategy type (pullback / breakout), conviction level, liquidity class, RS value at entry, MACD state at entry, `run_type` (eod / intraday)
+- **Trade timeline:** entry date → trail trigger date (if applicable) → exit date, hold duration in trading days
+- **Financial summary:** entry price, exit price, shares, gross P&L, actual costs (entry + exit commission from IBKR), net P&L
+- **R multiple achieved** vs planned (e.g. planned 1:2, achieved 1:3.4)
+- **Exit narrative:** exit reason (`trail_hit`, `stop_hit`, `time_exit`, `manual`), `bot_initiated` flag, optional note
+- **All-time high reached** during the trade (for chart annotation and R multiple context)
+
+**Format:** HTML report per trade — renderable in any browser, printable, archivable. Generated on demand, not in real time.
+
+### B. Portfolio Summary Report
+
+An on-demand snapshot of the current state:
+
+- All open positions: instrument, entry date, entry price, current price, unrealised P&L, current stop level, trail status
+- Running portfolio risk: current open risk %, proximity to 6% ceiling
+- YTD closed trade summary: number of trades, win rate, average R multiple, gross and net P&L
+- Daily loss limit status
+
+### C. Annual Tax Export
+
+**Purpose:** compliance with Belgian capital gains tax (applicable from 2027 on profits above €10,000 annually).
+
+**Per-position fields required:**
+- ISIN, instrument name, open date, close date, quantity
+- Entry price, exit price, gross profit/loss
+- Actual costs (TOB + commissions, entry + exit)
+- Net profit/loss
+
+**Annual aggregate row:** total gross profit, total costs, total net profit.
+
+**Format:** CSV export per calendar year — simple to hand to an accountant or load into tax software.
+
+> **ISIN note:** tax authorities typically require ISIN codes rather than exchange tickers. IBKR provides ISIN via contract details. Store it at signal time — don't rely on being able to look it up later.
+
+### D. Technology
+
+- **Charts:** Plotly (Python) — generates interactive HTML charts suitable for the per-trade diary
+- **Tax export:** pandas → CSV from the SQLite positions table
+- **Trigger:** CLI — `python -m report_generator trade ASML.AS 2026-04-12`, `python -m report_generator tax 2026`, `python -m report_generator summary`
+- **No real-time dependency:** reads from SQLite only; does not connect to IBKR or the live bot
+
+---
+
+## 14. Pre-Build Decisions & System Parameters
 
 ### A. Signal Interface Contract
 
@@ -601,6 +693,7 @@ All fields required before the Order Executor will proceed:
 | Field | Type | Description |
 |---|---|---|
 | instrument_id | str | IBKR contract ID (conid) |
+| isin | str | ISIN code — sourced from IBKR contract details; stored for tax reporting |
 | ticker | str | Human-readable ticker for logs and notifications |
 | direction | str | 'long' — short out of scope for v1 |
 | entry_price | float | Signal engine's intended entry level |
@@ -614,13 +707,35 @@ All fields required before the Order Executor will proceed:
 | run_type | str | 'eod' or 'intraday' — which engine run produced this signal |
 | reference_price | float | EOD closing price used to calculate stop/target (may differ from entry_price on intraday runs) |
 
-### B. Watchlist
+### B. Position Record Schema
+
+Fields stored per position in SQLite (additions beyond the signal contract):
+
+| Field | Type | Description |
+|---|---|---|
+| fill_price | float | Actual entry fill price from IBKR |
+| fill_timestamp | datetime | Exchange fill timestamp |
+| shares | int | Number of shares filled |
+| entry_commission | float | Actual entry costs from IBKR (TOB + exchange fee) |
+| exit_price | float | Actual exit fill price |
+| exit_timestamp | datetime | Exchange exit timestamp |
+| exit_commission | float | Actual exit costs from IBKR |
+| exit_reason | str | Structured: trail_hit / stop_hit / time_exit / manual |
+| bot_initiated | bool | False if position was closed manually by user |
+| exit_note | str\|None | Optional free-text note for trading diary |
+| peak_price | float | All-time high price reached during the trade |
+| trail_triggered | bool | Whether the ATR trail was activated |
+| trail_trigger_price | float\|None | Price at which trail was triggered |
+| gross_pnl | float | (exit_price − entry_price) × shares |
+| net_pnl | float | gross_pnl − entry_commission − exit_commission |
+
+### C. Watchlist
 
 - **Primary:** Eurostoxx 600 full constituent list — static file updated periodically
 - **Secondary:** custom fixed list of smaller EU-denominated stocks, manually curated
 - EU-denominated equities only — no US names, no ADRs in v1
 
-### C. Data Sources Summary
+### D. Data Sources Summary
 
 | Data Type | Source | Notes |
 |---|---|---|
@@ -628,18 +743,19 @@ All fields required before the Order Executor will proceed:
 | Real-time prices | IBKR TWS API | Event-driven; live ask/bid for order submission |
 | Portfolio value | IBKR TWS API (live) | Queried live for all position sizing |
 | Tick size | IBKR reqMarketRule | Per instrument, per price tier |
+| ISIN + contract details | IBKR reqContractDetails | Fetched at signal time; stored on position record |
 | Earnings dates | IBKR reqFundamentalData | Best-effort; conservative fallback |
 | Market hours | IBKR trading hours per contract | For open/close pause conditions |
 | Benchmark | Yahoo Finance (^STOXX50E) | RS line and market regime filter |
 
-### D. Notifications
+### E. Notifications
 
 - **Channel:** Telegram bot — free, reliable, simple API
 - **Config:** bot token and chat ID in YAML config — never hardcoded
 - **Format:** emoji-prefixed structured messages for quick mobile scanning
-  - 🟢 BUY filled · 🔴 STOP hit · ⚠️ Skip · 🔔 Trail updated · 🕐 Time exit · ⚡ System event
+  - 🟢 BUY filled · 🔴 STOP hit · ⚠️ Skip · 🔔 Trail updated · 🕐 Time exit · ✋ Manual exit detected · ⚡ System event
 
-### E. Configuration Structure
+### F. Configuration Structure
 
 ```yaml
 risk:
@@ -699,11 +815,15 @@ logging:
   log_dir: './logs'
   sqlite_path: './data/trading.db'
   retain_days: 90
+
+reporting:
+  report_dir: './reports'
+  tax_year_start_month: 1   # January
 ```
 
 ---
 
-## 14. IBKR API — Preliminary Notes
+## 15. IBKR API — Preliminary Notes
 
 - **TWS API via IB Gateway:** preferred — designed for API-only use, lighter than full TWS
 - **Python `ib_insync`:** standard wrapper; event-driven, asyncio-based
@@ -712,7 +832,7 @@ logging:
 
 ---
 
-## 15. Functional Requirements
+## 16. Functional Requirements
 
 Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) · **Could** (deferrable)
 
@@ -743,23 +863,23 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | SE-03 | Signal Engine | Run Strategy A and B independently; signal fires if either passes (OR logic) | Must |
 | SE-04 | Signal Engine | Annotate elevated conviction when both strategies fire simultaneously | Should |
 | SE-05 | Signal Engine | Annotate elevated conviction when price is within 5% of 52-week high | Should |
-| SE-06 | Signal Engine | Emit structured signal with all required interface fields (see Section 13A) | Must |
-| SE-07 | Signal Engine | Classify instrument liquidity (liquid / thin) at signal time | Should |
-| SE-08 | Signal Engine | Calculate RS line vs ^STOXX50E benchmark per instrument | Should |
-| SE-09 | Signal Engine | Apply market regime filter — reduce or pause signals in bear market conditions | Should |
-| SE-10 | Signal Engine | Flag instruments with upcoming binary events before emitting signal | Should |
-| SE-11 | Signal Engine | Log every signal fired with full parameters, indicator values, and conviction level | Must |
-| SE-12 | Signal Engine | Log every signal skipped with reason | Must |
-| SE-13 | Signal Engine | Support Eurostoxx 600 universe + custom fixed list as watchlist sources | Must |
-| SE-14 | Signal Engine | Run scheduled intraday scans at 13:30, 14:30, and 15:30 (local exchange time) for Strategy B only | Must |
-| SE-15 | Signal Engine | Intraday mode: evaluate price condition against IBKR live price; extrapolate intraday volume to full-session equivalent | Must |
-| SE-16 | Signal Engine | Intraday mode: apply per-run volume multipliers (13:30 → 1.8×, 14:30 → 1.6×, 15:30 → 1.5×) configurable in YAML | Must |
-| SE-17 | Signal Engine | Intraday mode: reuse EMA chain, MACD, and market regime from EOD Parquet data — do not recalculate from partial intraday bars | Must |
-| SE-18 | Signal Engine | Intraday mode: re-validate R:R from scratch against live ask price at run time — R:R gate is never relaxed | Must |
-| SE-19 | Signal Engine | Maintain in-memory session rejection store: tickers rejected for compressed R:R in any intraday run are skipped in all subsequent intraday runs that session | Must |
-| SE-20 | Signal Engine | Intraday deduplication: skip tickers with an open position, a pending order, or an entry in the session rejection store | Must |
-| SE-21 | Signal Engine | Tickers that fail the price condition intraday (no longer above 50-day high) are NOT added to the rejection store — a clean breakout later in the session is a fresh signal | Must |
-| SE-22 | Signal Engine | Add `run_type` field ('eod' \| 'intraday') to signal payload; add `reference_price` field (EOD close used for stop/target calculation) | Must |
+| SE-06 | Signal Engine | Emit structured signal with all required interface fields including ISIN and run_type (see Section 14A) | Must |
+| SE-07 | Signal Engine | Fetch ISIN and instrument name from IBKR reqContractDetails at signal time | Must |
+| SE-08 | Signal Engine | Classify instrument liquidity (liquid / thin) at signal time | Should |
+| SE-09 | Signal Engine | Calculate RS line vs ^STOXX50E benchmark per instrument | Should |
+| SE-10 | Signal Engine | Apply market regime filter — reduce or pause signals in bear market conditions | Should |
+| SE-11 | Signal Engine | Flag instruments with upcoming binary events before emitting signal | Should |
+| SE-12 | Signal Engine | Log every signal fired with full parameters, indicator values, and conviction level | Must |
+| SE-13 | Signal Engine | Log every signal skipped with reason | Must |
+| SE-14 | Signal Engine | Support Eurostoxx 600 universe + custom fixed list as watchlist sources | Must |
+| SE-15 | Signal Engine | Run scheduled intraday scans at 13:30, 14:30, and 15:30 (local exchange time) for Strategy B only | Must |
+| SE-16 | Signal Engine | Intraday mode: evaluate price condition against IBKR live price; extrapolate intraday volume to full-session equivalent | Must |
+| SE-17 | Signal Engine | Intraday mode: apply per-run volume multipliers (13:30 → 1.8×, 14:30 → 1.6×, 15:30 → 1.5×) configurable in YAML | Must |
+| SE-18 | Signal Engine | Intraday mode: reuse EMA chain, MACD, and market regime from EOD Parquet data — do not recalculate from partial intraday bars | Must |
+| SE-19 | Signal Engine | Intraday mode: re-validate R:R from scratch against live ask price at run time — R:R gate is never relaxed | Must |
+| SE-20 | Signal Engine | Maintain in-memory session rejection store: tickers rejected for compressed R:R in any intraday run are skipped in all subsequent intraday runs that session | Must |
+| SE-21 | Signal Engine | Intraday deduplication: skip tickers with an open position, a pending order, or an entry in the session rejection store | Must |
+| SE-22 | Signal Engine | Tickers that fail the price condition intraday (no longer above 50-day high) are NOT added to the rejection store — a clean breakout later in the session is a fresh signal | Must |
 | SE-23 | Signal Engine | Log intraday run results: tickers evaluated, skipped (with reason), signals fired, rejection store additions | Must |
 
 ### Risk Layer
@@ -792,7 +912,7 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | OE-09 | Order Executor | Verify market data feed live and current before any order | Must |
 | OE-10 | Order Executor | Flag and skip first trade after Gateway reconnect; notify | Should |
 | OE-11 | Order Executor | Check ex-dividend date proximity before submission | Should |
-| OE-12 | Order Executor | Log all submissions, fills, cancellations with full parameters | Must |
+| OE-12 | Order Executor | Log all submissions, fills, and cancellations including actual IBKR-reported costs | Must |
 | OE-13 | Order Executor | Never submit corrective sell after entry fill — exits via stop/target/trail only | Must |
 
 ### Position Manager
@@ -811,10 +931,14 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | PM-10 | Position Manager | Time exit only fires if: signal queue non-empty AND open risk ≥ 6% | Must |
 | PM-11 | Position Manager | When time exit conditions met: close only if within 20–30% of stop distance; otherwise hold | Must |
 | PM-12 | Position Manager | Never force-close a position at a loss based on time alone — stop manages invalidation | Must |
-| PM-13 | Position Manager | Log all time exit evaluations with conditions checked, decision, and rationale | Must |
-| PM-14 | Position Manager | Notify on trail trigger, significant trail updates, and time exit decisions | Must |
-| PM-15 | Position Manager | All multipliers and time limit configurable in YAML config | Must |
-| PM-16 | Position Manager | Notify the Risk Layer whenever the active stop is updated, passing ticker and new stop level so the Risk Layer can recalculate the live risk amount for that position (see RL-10) | Must |
+| PM-13 | Position Manager | Detect position closures not initiated by the bot; record as exit_reason: manual | Must |
+| PM-14 | Position Manager | Support CLI fallback for manual exit recording: close <ticker> <price> manual | Must |
+| PM-15 | Position Manager | Store bot_initiated flag and optional exit_note on all closed position records | Must |
+| PM-16 | Position Manager | Track and store peak_price (all-time high during trade) for diary reporting | Must |
+| PM-17 | Position Manager | Log all time exit evaluations with conditions checked, decision, and rationale | Must |
+| PM-18 | Position Manager | Notify on trail trigger, significant trail updates, time exit decisions, and manual exit detection | Must |
+| PM-19 | Position Manager | All multipliers and time limit configurable in YAML config | Must |
+| PM-20 | Position Manager | Notify the Risk Layer whenever the active stop is updated, passing ticker and new stop level so the Risk Layer can recalculate the live risk amount for that position (see RL-10) | Must |
 
 ### Market Data
 
@@ -836,10 +960,11 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | NL-04 | Notifications | Notify on stop hit or target reached with trade summary and P&L | Must |
 | NL-05 | Notifications | Notify on trail triggered and significant trail stop updates | Must |
 | NL-06 | Notifications | Notify on time exit evaluation decision | Should |
-| NL-07 | Notifications | Notify on any pause condition triggered | Must |
-| NL-08 | Notifications | Use emoji-prefixed structured format for quick mobile scanning | Should |
-| NL-09 | Notifications | Notifications are informational only — no action required under normal operation | Must |
-| NL-10 | Notifications | Notify on intraday signal fired: include run time, live entry price, R:R, and volume confirmation ratio | Should |
+| NL-07 | Notifications | Notify on manual exit detected (bot_initiated: false) | Must |
+| NL-08 | Notifications | Notify on any pause condition triggered | Must |
+| NL-09 | Notifications | Use emoji-prefixed structured format for quick mobile scanning | Should |
+| NL-10 | Notifications | Notifications are informational only — no action required under normal operation | Must |
+| NL-11 | Notifications | Notify on intraday signal fired: include run time, live entry price, R:R, and volume confirmation ratio | Should |
 
 ### Logging & Analytics
 
@@ -849,9 +974,26 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | LL-02 | Logging | Log every calculation with inputs and outputs (R:R, sizing, tick rounding, ATR trail) | Must |
 | LL-03 | Logging | Log every event across all components with full context and timestamp | Must |
 | LL-04 | Logging | Populate SQLite analytics DB from log processor for structured post-trade queries | Must |
-| LL-05 | Logging | Retain full audit trail of all system decisions | Must |
-| LL-06 | Logging | SQLite accessible via SSH tunnel only — database port never exposed to internet | Must |
-| LL-07 | Logging | Analytics dashboard (daily summary: trades, skips, open risk, P&L, system health) | Could |
+| LL-05 | Logging | Store actual IBKR-reported costs (entry + exit commission) on every closed position record | Must |
+| LL-06 | Logging | Store ISIN, exit_reason, bot_initiated, exit_note, peak_price on every closed position record | Must |
+| LL-07 | Logging | Retain full audit trail of all system decisions | Must |
+| LL-08 | Logging | SQLite accessible via SSH tunnel only — database port never exposed to internet | Must |
+| LL-09 | Logging | Analytics dashboard (daily summary: trades, skips, open risk, P&L, system health) | Could |
+
+### Report Generator
+
+| ID | Component | Requirement | Priority |
+|---|---|---|---|
+| RG-01 | Report Generator | Generate per-trade HTML report including annotated price chart, signal metadata, trade timeline, financial summary, and R multiple achieved | Must |
+| RG-02 | Report Generator | Annotate chart with: entry, initial stop, cost-floor level, target, trail stop progression, exit point, peak price | Must |
+| RG-03 | Report Generator | Include exit narrative in report: exit_reason, bot_initiated flag, run_type, optional exit_note | Must |
+| RG-04 | Report Generator | Generate portfolio summary report: open positions, running risk, YTD closed trade stats | Should |
+| RG-05 | Report Generator | Generate annual tax export as CSV: all closed positions with ISIN, dates, prices, quantities, gross P&L, actual costs, net P&L | Must |
+| RG-06 | Report Generator | Tax export covers one calendar year; filterable by year via CLI | Must |
+| RG-07 | Report Generator | Tax export includes annual aggregate row: total gross profit, total costs, total net profit | Must |
+| RG-08 | Report Generator | All reports generated on demand via CLI — not in real time | Must |
+| RG-09 | Report Generator | Report generator reads from SQLite only — no live IBKR connection required | Must |
+| RG-10 | Report Generator | Reports saved to configurable output directory (reporting.report_dir in config) | Must |
 
 ### Security & Infrastructure
 
