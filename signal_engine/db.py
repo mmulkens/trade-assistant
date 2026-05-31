@@ -56,6 +56,8 @@ _COLUMNS: list[tuple[str, str, str]] = [
     ("near_52wk_high",      "INTEGER",            "1 if price within near_52wk_high_pct% of 52-wk high"),
     ("market_regime",       "TEXT",               "'bull' | 'bear' | 'unknown' at scan time"),
     ("rs_value",            "REAL",               "stock / benchmark ratio at signal time"),
+    ("run_type",            "TEXT",               "'eod' | 'intraday' — execution context"),
+    ("processed",           "INTEGER",            "1 once handled by SX or executor; NULL/0 = unprocessed"),
 ]
 
 # Derive the CREATE TABLE statement from _COLUMNS so schema and migration
@@ -78,8 +80,8 @@ INSERT INTO signals (
     liquidity_class, conviction, earnings_flag, stop_capped,
     swing_low_stop, atr_stop, stop_method,
     strategy_a_fired, strategy_b_fired, near_52wk_high,
-    market_regime, rs_value
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    market_regime, rs_value, run_type
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 # ---------------------------------------------------------------------------
@@ -141,6 +143,7 @@ def save_signals(signals: list["Signal"], db_path: str) -> int:
             int(s.near_52wk_high),
             s.market_regime,
             s.rs_value,
+            s.run_type,
         )
         for s in signals
     ]

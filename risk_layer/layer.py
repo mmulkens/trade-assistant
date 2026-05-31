@@ -261,7 +261,15 @@ class RiskLayer:
             reject_reason=None,
         )
 
-    def open_position(self, decision: RiskDecision) -> int:
+    def open_position(
+        self,
+        decision: RiskDecision,
+        fill_price: Optional[float] = None,
+        fill_timestamp: Optional[str] = None,
+        entry_commission: Optional[float] = None,
+        bot_initiated: bool = False,
+        peak_price: Optional[float] = None,
+    ) -> int:
         """Persist an approved trade to the state store after the order fills.
 
         Must only be called after Order Executor confirms a fill — not on
@@ -286,16 +294,25 @@ class RiskLayer:
             signal_type=sig.signal_type,
             conviction=sig.conviction,
             db_path=self._db_path,
+            target_price=sig.target_price,
+            run_type=getattr(sig, "run_type", None),
+            fill_price=fill_price,
+            fill_timestamp=fill_timestamp,
+            entry_commission=entry_commission,
+            bot_initiated=bot_initiated,
+            peak_price=peak_price,
         )
         self._logger.info({
             "event": "position_opened",
             "ticker": sig.ticker,
             "instrument_id": sig.instrument_id,
             "shares": decision.shares,
+            "fill_price": fill_price,
             "entry": sig.entry_price,
             "stop": sig.stop_price,
             "risk_amount": decision.risk_amount,
             "position_risk_pct": decision.position_risk_pct,
+            "bot_initiated": bot_initiated,
             "row_id": row_id,
         })
         return row_id

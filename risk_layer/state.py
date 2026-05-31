@@ -54,6 +54,23 @@ _POSITION_COLUMNS: list[tuple[str, str]] = [
     ("close_price",             "REAL"),
     ("realized_pnl",            "REAL"),
     ("close_reason",            "TEXT"),                # 'stop' | 'target' | 'trail' | 'manual'
+    # --- Fill details (set by Order Executor / SX at open time) ---
+    ("target_price",            "REAL"),                # signal target; stored for PM reference
+    ("isin",                    "TEXT"),                # ISIN — None until IBKR integration
+    ("run_type",                "TEXT"),                # 'eod' | 'intraday'
+    ("fill_price",              "REAL"),                # actual fill; = entry_price for SX
+    ("fill_timestamp",          "TEXT"),                # UTC ISO-8601 timestamp of fill
+    ("entry_commission",        "REAL"),                # TOB flat estimate at entry
+    ("bot_initiated",           "INTEGER"),             # 1 = opened by the bot (SX or live executor)
+    # --- Exit details (set by Position Manager or manual close) ---
+    ("exit_commission",         "REAL"),                # TOB at exit
+    ("exit_note",               "TEXT"),                # free-text close annotation
+    # --- Position tracking (updated continuously by Position Manager) ---
+    ("peak_price",              "REAL"),                # highest price seen; init = fill_price
+    ("trail_triggered",         "INTEGER"),             # 1 once trailing stop is active
+    ("trail_trigger_price",     "REAL"),                # price level that activated the trail
+    ("gross_pnl",               "REAL"),                # (exit_price - entry_price) × shares
+    ("net_pnl",                 "REAL"),                # gross_pnl - entry_commission - exit_commission
 ]
 
 # Columns without a PRIMARY KEY constraint can be added by forward migration
@@ -77,8 +94,10 @@ _INSERT_POSITION = """
 INSERT INTO risk_positions (
     ticker, instrument_id, entry_price, stop_price, shares,
     risk_per_share, risk_amount, position_risk_pct, portfolio_value_at_open,
-    liquidity_class, signal_type, conviction, status, opened_at
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    liquidity_class, signal_type, conviction, status, opened_at,
+    target_price, run_type, fill_price, fill_timestamp,
+    entry_commission, bot_initiated, peak_price, trail_triggered
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 
@@ -126,6 +145,13 @@ def add_position(
     signal_type: str,
     conviction: str,
     db_path: str,
+    target_price: Optional[float] = None,
+    run_type: Optional[str] = None,
+    fill_price: Optional[float] = None,
+    fill_timestamp: Optional[str] = None,
+    entry_commission: Optional[float] = None,
+    bot_initiated: bool = False,
+    peak_price: Optional[float] = None,
 ) -> int:
     """Insert a new open position. Returns the new row id.
 
@@ -142,6 +168,10 @@ def add_position(
                 risk_per_share, risk_amount, position_risk_pct,
                 portfolio_value_at_open, liquidity_class, signal_type,
                 conviction, "open", opened_at,
+                target_price, run_type, fill_price, fill_timestamp,
+                entry_commission, int(bot_initiated),
+                peak_price if peak_price is not None else fill_price,
+                0,  # trail_triggered: always False at open
             ),
         )
         return cur.lastrowid

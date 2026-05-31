@@ -66,6 +66,7 @@ class Signal:
     near_52wk_high: bool        # Price within near_52wk_high_pct% of 52-week high?
     market_regime: str          # 'bull' | 'bear' | 'unknown' at scan time
     rs_value: Optional[float]   # Stock / benchmark ratio at signal time
+    run_type: str = 'eod'       # 'eod' | 'intraday' — execution context for the signal
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +342,7 @@ class SignalEngine:
             near_52wk_high=near_52wk,
             market_regime=regime,
             rs_value=rs_val,
+            run_type='eod',
         )
 
         self._logger.info({
