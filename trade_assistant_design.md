@@ -993,7 +993,8 @@ ibkr:
   paper_port: 4002
   live_port: 4001
   host: 127.0.0.1      # always localhost — Gateway runs on same server
-  client_id: 1         # arbitrary ID; must be unique if multiple connections
+  gateway_con: 1       # connection label — arbitrary number, not your account number;
+                       # must be unique if multiple scripts connect to Gateway simultaneously
   readonly: false
 ```
 
@@ -1009,17 +1010,38 @@ The paper account has its own portfolio value (configured in IBKR's paper tradin
 
 ---
 
-### G. One-Time Account Setup Checklist
+### G. IBC Credential Storage
+
+IBC stores your IBKR login in a plain text file on the server, typically at `/opt/ibc/config.ini`:
+
+```ini
+IbLoginId=your_ibkr_username
+IbPassword=your_ibkr_password
+TradingMode=paper   # switch to 'live' when ready
+```
+
+Because this file contains brokerage credentials in plain text, two controls are mandatory:
+
+**File permissions:** the file must be readable only by the user account that runs the bot. Set once with `chmod 600 /opt/ibc/config.ini` and it persists. This is what SI-05 refers to.
+
+**Two-factor authentication:** IBKR's default login requires a second factor (they call it the Secure Login System), which IBC cannot handle interactively on a headless server. The solution is IBKR's **trusted IP exemption**: once your server's fixed IP is whitelisted in the IBKR account portal, IBKR skips the second factor for logins originating from that IP. This is why SI-01 (the IP whitelist) must be configured before IBC can log in headlessly — the whitelist serves double duty as both a security control and the 2FA bypass mechanism.
+
+**The config.ini file is never committed to version control.** It lives only on the server.
+
+---
+
+### H. One-Time Account Setup Checklist
 
 These steps are performed once when the IBKR account is approved and Gateway is installed. They are configuration actions in the IBKR account portal and Gateway settings, not code.
 
 - [ ] Enable API access in IBKR account settings (Client Portal → Settings → API)
-- [ ] Set trusted IP whitelist to the cloud server's fixed IP address (SI-01)
+- [ ] Set trusted IP whitelist to the cloud server's fixed IP address — this also enables the 2FA exemption required for headless IBC login (SI-01)
 - [ ] Configure account-level daily order value limit and maximum order size (SI-02)
 - [ ] Subscribe to required market data packages: Euronext Amsterdam, Euronext Paris, Euronext Brussels, XETRA, Borsa Italiana, BME, Nasdaq Helsinki, Nasdaq Stockholm, Wiener Börse, Euronext Lisbon, Euronext Dublin, London Stock Exchange
 - [ ] Enable paper trading account and note the paper username
 - [ ] Install IB Gateway on the cloud server
-- [ ] Install and configure IBC with credentials and 23:30 restart schedule
+- [ ] Create `/opt/ibc/config.ini` with credentials; set permissions to `chmod 600` (SI-05)
+- [ ] Configure IBC with 23:30 daily restart schedule
 - [ ] Verify Gateway starts headlessly and bot can connect on paper port (4002)
 - [ ] Confirm market data streams are live for at least one instrument from each exchange
 
