@@ -880,7 +880,8 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | SE-20 | Signal Engine | Maintain in-memory session rejection store: tickers rejected for compressed R:R in any intraday run are skipped in all subsequent intraday runs that session | Must |
 | SE-21 | Signal Engine | Intraday deduplication: skip tickers with an open position, a pending order, or an entry in the session rejection store | Must |
 | SE-22 | Signal Engine | Tickers that fail the price condition intraday (no longer above 50-day high) are NOT added to the rejection store — a clean breakout later in the session is a fresh signal | Must |
-| SE-23 | Signal Engine | Log intraday run results: tickers evaluated, skipped (with reason), signals fired, rejection store additions | Must |
+| SE-23 | Signal Engine | Add `run_type` field ('eod' \| 'intraday') to signal payload; add `reference_price` field (EOD close used for stop/target calculation) | Must |
+| SE-24 | Signal Engine | Log intraday run results: tickers evaluated, skipped (with reason), signals fired, rejection store additions | Must |
 
 ### Risk Layer
 
