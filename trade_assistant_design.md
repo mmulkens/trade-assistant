@@ -20,7 +20,7 @@
 12. [Design Consideration 11 — Logging & Analytics](#12-design-consideration-11--logging--analytics)
 13. [Design Consideration 12 — Reporting](#13-design-consideration-12--reporting)
 14. [Pre-Build Decisions & System Parameters](#14-pre-build-decisions--system-parameters)
-15. [IBKR API — Preliminary Notes](#15-ibkr-api--preliminary-notes)
+15. [Design Consideration 13 — IBKR Connectivity](#15-design-consideration-13--ibkr-connectivity)
 16. [Functional Requirements](#16-functional-requirements)
 
 ---
@@ -823,12 +823,205 @@ reporting:
 
 ---
 
-## 15. IBKR API — Preliminary Notes
+## 15. Design Consideration 13 — IBKR Connectivity
 
-- **TWS API via IB Gateway:** preferred — designed for API-only use, lighter than full TWS
-- **Python `ib_insync`:** standard wrapper; event-driven, asyncio-based
-- **Paper trading:** mandatory for all development and testing before live deployment
-- **Direct IBKR account:** API permissions, IP whitelist, and order limits configured directly without introducing broker involvement
+---
+
+### A. Component Inventory
+
+There are four distinct pieces of software involved in the IBKR integration. They are separate programs that work together — understanding what each one does prevents confusion during setup and debugging.
+
+#### IB Gateway
+
+A program provided by IBKR that runs permanently on the cloud server and maintains an authenticated session with IBKR's systems. It is the only component that ever communicates with IBKR over the internet. Your Python bot never talks to IBKR directly — it only talks to Gateway, and Gateway handles everything else.
+
+Gateway is the stripped-down sibling of Trader Workstation (TWS), the full desktop trading platform. TWS is designed for humans — charts, watchlists, a full GUI. Gateway has none of that. It exists solely to expose a local connection that your code can use. It uses significantly less memory and CPU than TWS, and it is designed for programmatic, always-on use. **Gateway is the right choice for this system; TWS is not.**
+
+One important property: **orders and stop orders placed via Gateway live at IBKR's side once submitted.** If the bot crashes after placing a stop, the stop is still active. The bot's own memory is not the source of truth for live orders — IBKR's systems are.
+
+#### IBC (IB Controller)
+
+An open-source tool that automates the Gateway startup sequence. Gateway is a Java application that, even in server mode, starts with a login dialog requiring a username and password to be entered. Without IBC, someone would need to log in manually every time Gateway starts or restarts — which on a headless cloud server would require a remote desktop session.
+
+IBC handles: injecting credentials at startup, clicking through any confirmation dialogs, and managing the scheduled daily restart (Gateway requires a brief restart once per day; the time is configurable, typically set to 23:30 when markets are closed).
+
+**The startup sequence on the server is:**
+```
+Server boots
+    → IBC launches
+        → IBC starts IB Gateway
+            → IBC injects credentials and clicks through login
+                → Gateway authenticates with IBKR
+                    → Gateway listens for local connections
+                        → Python bot connects
+```
+
+Without IBC, this chain requires manual intervention. With IBC, the entire sequence is automated and survives server reboots.
+
+#### ibapi
+
+IBKR's official Python client library. This is the low-level layer — it handles the actual message formatting and the connection to Gateway's local port. It works via callbacks: you define functions like `orderStatus()` and `position()`, and the library calls them when data arrives from Gateway. It is functional but verbose — managing the request/response state across callbacks requires significant boilerplate.
+
+`ibapi` must be installed but is rarely used directly in this codebase.
+
+#### ib_insync
+
+A community-built wrapper around `ibapi` that makes the API behave like a normal sequential Python program rather than a callback maze. It adds an event loop under the hood and exposes clean, readable calls:
+
+```python
+# With ib_insync — reads as a normal function call
+positions = ib.positions()
+
+# Without it (raw ibapi) — send a request, then handle the result
+# in a completely separate callback method elsewhere in the code
+self.reqPositions()
+# ... later, in a different method the library calls automatically:
+def position(self, account, contract, position, avgCost):
+    ...
+```
+
+`ib_insync` also exposes events your code can subscribe to — `ib.orderStatusEvent`, `ib.positionEvent`, etc. — which is how the Position Manager detects manual exits and how the Order Executor receives fill confirmations without polling.
+
+**Decision: ib_insync is the Python interface used throughout this system.** It is widely used for exactly this use case, actively maintained, and integrates cleanly with a scheduler. Both `ibapi` and `ib_insync` must be installed as dependencies.
+
+---
+
+### B. Connection Architecture
+
+```
+Cloud Server
+┌─────────────────────────────────────────────────────┐
+│                                                     │
+│   IBC                                               │
+│    └── launches and manages                         │
+│         IB Gateway  ←──── authenticated session ──────────► IBKR Servers ──► Euronext / XETRA
+│              ↑                                      │
+│              │ local connection (same machine)      │
+│              │                                      │
+│         Python Bot                                  │
+│          ├── Signal Engine  (reads live prices)     │
+│          ├── Order Executor (submits orders)        │
+│          ├── Position Manager (updates stops)       │
+│          └── Risk Layer (reads portfolio value)     │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+Gateway and the Python bot run on the same server and communicate locally — no network request leaves the server for this leg of the journey. The internet-facing connection is solely between Gateway and IBKR's servers.
+
+**Local ports used:**
+
+| Mode | Port |
+|---|---|
+| Live trading | 4001 |
+| Paper trading | 4002 |
+
+These ports are only reachable from within the server itself. They are never exposed to the internet (enforced by the server firewall — see SI-04).
+
+---
+
+### C. Which Components Use Gateway, and For What
+
+The Data Fetcher and Report Generator never touch Gateway. Every other component does, for specific purposes:
+
+| Component | Uses Gateway for | Type of interaction |
+|---|---|---|
+| Signal Engine | Live ask price (intraday runs) | Subscribes to live price stream; Gateway pushes updates |
+| Signal Engine | Contract details and ISIN | Request/response — called once per new signal |
+| Signal Engine | Tick size per instrument | Request/response — called once per instrument |
+| Risk Layer | Live portfolio value | Request/response — called before every position sizing calculation |
+| Risk Layer | Current open positions on startup | Request/response — called once at bot startup to sync state |
+| Order Executor | Submit entry limit orders | One-way instruction; fill confirmation arrives as an event |
+| Order Executor | Submit initial stop orders | One-way instruction after fill confirmed |
+| Order Executor | Verify market open / auction status | Read from contract details (trading hours field) |
+| Position Manager | Modify stop orders (trail updates) | One-way instruction each time the active stop level rises |
+| Position Manager | Detect manual exits | Subscribes to position change events; Gateway pushes unsolicited updates |
+
+---
+
+### D. Order and Fill Lifecycle
+
+The sequence from Risk Layer approval to portfolio state fully updated:
+
+**1. Risk Layer approves** — produces a RiskDecision (shares, stop price, approved = True). Nothing has touched Gateway yet.
+
+**2. Order Executor checks the live price** — asks Gateway for the current ask on the instrument. Gateway has been receiving a live price stream since market open and answers immediately. The Executor performs the final cost-inclusive R:R check against this live price. If the stock has run since the signal was generated and R:R no longer clears, the order is skipped and logged.
+
+**3. Order Executor builds the order** — calculates the limit price (live ask + 0.5% buffer, rounded down to the correct tick), assembles the order instruction. Still local, nothing sent.
+
+**4. Order sent to Gateway** — the instruction is passed to Gateway via ib_insync. Gateway forwards it to IBKR's servers, which validate it (buying power, permissions, market open) and route it to the exchange. The order is now live in the exchange order book.
+
+**5. Fill event arrives** — when a matching seller is found, the exchange executes the trade and notifies IBKR's servers. IBKR notifies Gateway. Gateway pushes a fill event to the bot. The bot did not poll — Gateway sent it unsolicited. The fill event contains: actual fill price, exchange timestamp, actual commission charged.
+
+**6. Order Executor records the fill** — logs fill price, timestamp, and costs. Calls Risk Layer to register the open position.
+
+**7. Risk Layer updates state** — stores the open position in SQLite (using actual fill price, not signal price). Open risk budget updates. Future signals will see the reduced budget in Check 6.
+
+**8. Position Manager takes over** — immediately submits the initial stop order to Gateway. The stop now lives at IBKR — it will execute even if the bot is offline when it triggers. Position Manager stores the stop order ID for future modifications.
+
+**9. Telegram notification** — sent after fill and stop confirmation.
+
+---
+
+### E. Connection Lifecycle
+
+Gateway requires a scheduled daily restart (a limitation of the application). This is configured in IBC to occur at **23:30 local time** — after Euronext and XETRA close (17:30) and before any pre-market activity. During the restart window (typically under 2 minutes), the bot's connection to Gateway is briefly lost.
+
+**On disconnect:**
+
+The bot detects the disconnect via ib_insync's `disconnectedEvent`. It enters a waiting state: no signals are evaluated, no orders are submitted. A Telegram notification is sent.
+
+**On reconnect:**
+
+ib_insync's `connectedEvent` fires. The bot re-syncs its state from IBKR: it queries open positions and compares against its own SQLite records to detect any fills or stops that executed during the gap. After state sync is confirmed, the bot resumes normal operation — but skips placing any new orders for a brief settling period (OE-10). A Telegram notification confirms reconnection.
+
+**Stops during a disconnect:**
+
+Because stop orders live at IBKR (not in the bot's memory), they remain active during any Gateway disconnect or bot downtime. A stop hit while the bot is offline will execute normally. The bot will detect the resulting position closure when it reconnects and re-syncs state.
+
+---
+
+### F. Paper vs Live Configuration
+
+IBKR provides a paper trading account alongside the live account. Both are accessible via the same Gateway installation; the distinction is made at login time and reflected in the port number.
+
+The config file carries a top-level `mode` flag:
+
+```yaml
+ibkr:
+  mode: paper          # 'paper' | 'live'
+  paper_port: 4002
+  live_port: 4001
+  host: 127.0.0.1      # always localhost — Gateway runs on same server
+  client_id: 1         # arbitrary ID; must be unique if multiple connections
+  readonly: false
+```
+
+All components read `ibkr.mode` at startup and connect to the corresponding port. No other code changes are required to switch between paper and live. **Switching to live requires a deliberate config edit and a bot restart — it cannot happen accidentally.**
+
+The paper account has its own portfolio value (configured in IBKR's paper trading settings), its own position state, and its own order history. P&L from paper trading is simulated and has no financial consequence.
+
+**Mandatory progression before live trading:**
+1. Full development and unit testing against paper account on laptop
+2. Full pipeline integration testing against paper account on cloud server
+3. Minimum two weeks of paper trading in production configuration with no open issues
+4. Manual review of all paper trade logs before switching mode to live
+
+---
+
+### G. One-Time Account Setup Checklist
+
+These steps are performed once when the IBKR account is approved and Gateway is installed. They are configuration actions in the IBKR account portal and Gateway settings, not code.
+
+- [ ] Enable API access in IBKR account settings (Client Portal → Settings → API)
+- [ ] Set trusted IP whitelist to the cloud server's fixed IP address (SI-01)
+- [ ] Configure account-level daily order value limit and maximum order size (SI-02)
+- [ ] Subscribe to required market data packages: Euronext Amsterdam, Euronext Paris, Euronext Brussels, XETRA, Borsa Italiana, BME, Nasdaq Helsinki, Nasdaq Stockholm, Wiener Börse, Euronext Lisbon, Euronext Dublin, London Stock Exchange
+- [ ] Enable paper trading account and note the paper username
+- [ ] Install IB Gateway on the cloud server
+- [ ] Install and configure IBC with credentials and 23:30 restart schedule
+- [ ] Verify Gateway starts headlessly and bot can connect on paper port (4002)
+- [ ] Confirm market data streams are live for at least one instrument from each exchange
 
 ---
 
