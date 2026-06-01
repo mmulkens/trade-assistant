@@ -113,22 +113,34 @@ Complexity managed:
 
 ### E. Universe & Markets
 
-**Decision: EU equities, EUR-denominated, Euronext + XETRA primary**
+**Decision: US equities primary, Euronext optional add-on when profitable**
 
-- Euronext (AMS: .AS, PAR: .PA, BRU: .BR) and XETRA Frankfurt (.DE)
-- EUR denomination eliminates FX risk
-- Universe: full Eurostoxx 600 constituent list + custom fixed list of smaller EU-denominated stocks
+- **Primary universe:** S&P 500, Nasdaq 100, Russell 2000 — approximately 2,000 liquid names
+- **Real-time data:** free via IBKR for all US exchanges — no subscription required
+- **FX exposure:** USD/EUR on all positions; accepted as manageable given the relatively stable pair and the diversification across uncorrelated positions
+- **Belgian TOB tax:** does not apply to US stocks, slightly improving net R:R on every trade versus EU names
 
-*US tickers:* stubbed in settings but inactive by default. Phase 3+ expansion.
-*Rejected:* mandatory US market inclusion in Phase 1 — FX complexity without clear benefit.
+**Euronext (optional, deferred):**
+- Activate when the bot is demonstrably profitable
+- IBKR subscription: €3/month covers Amsterdam, Paris, Brussels, Lisbon, Dublin
+- Effective liquid universe after the €1M daily turnover filter: ~200–300 names, the best of which overlap with the existing `eurostoxx600.txt` file
+- XETRA (Germany) is a separate IBKR subscription and not included in the €3 bundle
+
+**Rejected for now:**
+- LSE — adds GBP risk on top of existing USD exposure; thinner than US for the strategies
+- Warsaw (WSE) — PLN currency risk; universe too thin after liquidity filter
+- EUR-denomination priority in the signal engine — adds complexity before there is live data to justify it; revisit after six months of live results
+
+*Market hours note:* US market hours are 15:30–22:00 Belgian time. EOD scan runs after 22:00; intraday runs shift to late afternoon/evening. Acceptable for an automated system.
 
 ### F. Benchmark
 
-**Decision: `^STOXX50E` (Eurostoxx 50) as primary benchmark**
+**Decision: `^GSPC` (S&P 500) as primary benchmark**
 
 - Used for RS (Relative Strength) line calculation in the signal engine
-- Used for market regime filter (reduce exposure in bear market conditions)
-- Swap to `^GSPC` or run dual benchmarks if US tickers are activated
+- Used for market regime filter — bull/bear determined by S&P 500 vs its 200-day EMA
+- Natural benchmark for the primary US universe
+- If Euronext is activated as a supplementary universe, add `^STOXX50E` as a secondary benchmark for EU names only
 
 ---
 
@@ -202,7 +214,7 @@ MACD is not a standalone strategy — it is an internal confirmation layer withi
 
 **Problem:** the EOD signal engine fires on the prior day's close. If a breakout stock gaps up at the open and never pulls back to yesterday's close, the Order Executor cannot enter at a viable R:R using a resting limit. High-conviction breakouts running hard early would be missed entirely.
 
-**Decision: scheduled intraday runs at 13:30, 14:30, and 15:30 (local exchange time), targeting Strategy B only.**
+**Decision: scheduled intraday runs at 17:30, 18:30, and 19:30 Belgian time (11:30, 12:30, 13:30 ET), targeting Strategy B only.**
 
 The intraday runs do not replace the EOD run — they complement it. The EOD run fires at market open (or pre-market) on EOD data and places resting limit orders for pullback signals. The intraday runs catch breakouts developing during the session and enter with a marketable limit at the current ask.
 
@@ -216,7 +228,7 @@ The intraday runs do not replace the EOD run — they complement it. The EOD run
 
 **Volume extrapolation:**
 ```python
-session_minutes_total = 510          # Euronext: 09:00–17:30
+session_minutes_total = 390          # NYSE/Nasdaq: 09:30–16:00 ET (15:30–22:00 Belgian time)
 elapsed_minutes = now - market_open
 extrapolated_volume = intraday_volume * (session_minutes_total / elapsed_minutes)
 confirmed = extrapolated_volume >= volume_multiplier * avg_20d_volume
@@ -224,11 +236,11 @@ confirmed = extrapolated_volume >= volume_multiplier * avg_20d_volume
 
 **Stricter volume multipliers for earlier runs** (less session elapsed = more extrapolation uncertainty):
 
-| Run time | Volume multiplier | Session elapsed (approx.) |
-|---|---|---|
-| 13:30 | 1.8× | ~55% |
-| 14:30 | 1.6× | ~67% |
-| 15:30 | 1.5× | ~78% (standard) |
+| Run time (Belgian) | Run time (ET) | Volume multiplier | Session elapsed (approx.) |
+|---|---|---|---|
+| 17:30 | 11:30 | 1.8× | ~55% |
+| 18:30 | 12:30 | 1.6× | ~67% |
+| 19:30 | 13:30 | 1.5× | ~78% (standard) |
 
 **R:R gate is always hard — never relaxed for intraday runs.** A breakout that has already moved so far that R:R is compressed is a worse trade regardless of conviction level. The three runs provide multiple opportunities to catch the signal at a viable price; if none of them produce a valid R:R, the trade is correctly skipped.
 
@@ -238,7 +250,7 @@ confirmed = extrapolated_volume >= volume_multiplier * avg_20d_volume
 2. Pending order check: if the ticker already has a live unconfirmed order from any earlier run today, skip.
 3. Session rejection store: if the ticker was evaluated and **rejected for compressed R:R** in any earlier intraday run today, it is added to an in-memory `intraday_rejections` store and skipped in all subsequent runs for the remainder of the session.
 
-The session rejection store is in-memory only and resets at the start of each trading day. It exists to prevent a "gap-and-crap" scenario: a stock that spiked at open (compressing R:R at 13:30), then partially faded (appearing to recover at 15:30), is not a clean setup and should not be re-evaluated.
+The session rejection store is in-memory only and resets at the start of each trading day. It exists to prevent a "gap-and-crap" scenario: a stock that spiked at open (compressing R:R at 17:30 Belgian), then partially faded (appearing to recover at 19:30), is not a clean setup and should not be re-evaluated.
 
 Note: tickers that fail the **price condition** (no longer above the 50-day high) at a given run time are NOT added to the rejection store — a fresh, clean breakout developing later in the session is a legitimate new signal.
 
@@ -246,7 +258,7 @@ Note: tickers that fail the **price condition** (no longer above the 50-day high
 
 **What changes in the codebase:**
 - `signal_engine`: add `intraday_mode` flag — runs Strategy B only, accepts live price and intraday volume as inputs, skips all EOD-only indicator recalculation
-- Scheduler: add three jobs at 13:30, 14:30, 15:30 calling the engine in `intraday_mode`
+- Scheduler: add three jobs at 17:30, 18:30, 19:30 Belgian time calling the engine in `intraday_mode`
 - Order Executor: no changes — receives a Signal object regardless of which run produced it
 - Signal payload: add `run_type` field (`eod` | `intraday`) for logging and audit purposes
 - In-memory `intraday_rejections` store: keyed by ticker, scoped to trading session
@@ -481,7 +493,7 @@ A separate IBKR account opened solely for the automated bot. Existing Mexem acco
 | Asset Class | Decision | Rationale |
 |---|---|---|
 | Equities (stocks) | In scope — v1, long only | Full system designed around this |
-| ETFs | Out of scope for bot | Handled via Mexem for passive investing |
+| ETFs | Out of scope for bot | Handled via separate account for passive investing |
 | Options | Ruled out | Too many simultaneous factors: direction, time, magnitude |
 | Futures | v2/v3 consideration | Margin mechanics, rollover, contract specs, extended hours |
 
@@ -731,9 +743,9 @@ Fields stored per position in SQLite (additions beyond the signal contract):
 
 ### C. Watchlist
 
-- **Primary:** Eurostoxx 600 full constituent list — static file updated periodically
-- **Secondary:** custom fixed list of smaller EU-denominated stocks, manually curated
-- EU-denominated equities only — no US names, no ADRs in v1
+- **Primary:** S&P 500, Nasdaq 100, Russell 2000 constituent lists — approximately 2,000 names; updated periodically as index compositions change
+- **Secondary (deferred):** Euronext liquid names (Amsterdam, Paris, Brussels, Lisbon, Dublin) — activate when bot is profitable and €3/month IBKR data subscription is taken out; existing `eurostoxx600.txt` file covers the liquid overlap
+- US equities only in v1 — no EU names, no ADRs until Euronext subscription is active
 
 ### D. Data Sources Summary
 
@@ -746,7 +758,7 @@ Fields stored per position in SQLite (additions beyond the signal contract):
 | ISIN + contract details | IBKR reqContractDetails | Fetched at signal time; stored on position record |
 | Earnings dates | IBKR reqFundamentalData | Best-effort; conservative fallback |
 | Market hours | IBKR trading hours per contract | For open/close pause conditions |
-| Benchmark | Yahoo Finance (^STOXX50E) | RS line and market regime filter |
+| Benchmark | Yahoo Finance (^GSPC) | RS line and market regime filter; ^STOXX50E added if Euronext universe activated |
 
 ### E. Notifications
 
@@ -778,13 +790,13 @@ signal_engine:
   ema_period: 21
   breakout_period: 50
   near_52wk_high_pct: 5
-  benchmark: '^STOXX50E'
+  benchmark: '^GSPC'
   intraday_runs:
-    - time: "13:30"
+    - time: "17:30"      # ~55% of US session elapsed (15:30–22:00 Belgian time)
       volume_multiplier: 1.8
-    - time: "14:30"
+    - time: "18:30"      # ~67% of US session elapsed
       volume_multiplier: 1.6
-    - time: "15:30"
+    - time: "19:30"      # ~78% of US session elapsed
       volume_multiplier: 1.5
 
 position_manager:
@@ -804,7 +816,10 @@ orders:
   stop_limit_band_pct: 0.4
 
 watchlist:
-  eurostoxx600: true
+  sp500: true
+  nasdaq100: true
+  russell2000: true
+  euronext: false        # activate with €3/month IBKR subscription when profitable
   custom: []
 
 notifications:
@@ -1065,7 +1080,7 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | DF-06 | Data Fetcher | Fetch in parallel: ThreadPoolExecutor, 8 workers, batches of 16, 2s pause between batches | Must |
 | DF-07 | Data Fetcher | Handle yfinance errors and retries gracefully; log failed tickers without crashing | Must |
 | DF-08 | Data Fetcher | Support `--full-refresh` CLI flag to force complete re-fetch | Must |
-| DF-09 | Data Fetcher | Fetch benchmark index (^STOXX50E) for RS line and market regime calculations | Must |
+| DF-09 | Data Fetcher | Fetch benchmark index (^GSPC) for RS line and market regime calculations; fetch ^STOXX50E additionally if Euronext universe is active | Must |
 | DF-10 | Data Fetcher | Log fetch summary: tickers attempted, succeeded, failed, rows added, duration | Must |
 | DF-11 | Data Fetcher | Support EODHD as drop-in replacement if yfinance quality degrades | Could |
 
@@ -1081,15 +1096,15 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | SE-06 | Signal Engine | Emit structured signal with all required interface fields including ISIN and run_type (see Section 14A) | Must |
 | SE-07 | Signal Engine | Fetch ISIN and instrument name from IBKR reqContractDetails at signal time | Must |
 | SE-08 | Signal Engine | Classify instrument liquidity (liquid / thin) at signal time | Should |
-| SE-09 | Signal Engine | Calculate RS line vs ^STOXX50E benchmark per instrument | Should |
+| SE-09 | Signal Engine | Calculate RS line vs ^GSPC benchmark per instrument (^STOXX50E for EU names if Euronext universe active) | Should |
 | SE-10 | Signal Engine | Apply market regime filter — reduce or pause signals in bear market conditions | Should |
 | SE-11 | Signal Engine | Flag instruments with upcoming binary events before emitting signal | Should |
 | SE-12 | Signal Engine | Log every signal fired with full parameters, indicator values, and conviction level | Must |
 | SE-13 | Signal Engine | Log every signal skipped with reason | Must |
 | SE-14 | Signal Engine | Support Eurostoxx 600 universe + custom fixed list as watchlist sources | Must |
-| SE-15 | Signal Engine | Run scheduled intraday scans at 13:30, 14:30, and 15:30 (local exchange time) for Strategy B only | Must |
+| SE-15 | Signal Engine | Run scheduled intraday scans at 17:30, 18:30, and 19:30 Belgian time (11:30, 12:30, 13:30 ET) for Strategy B only | Must |
 | SE-16 | Signal Engine | Intraday mode: evaluate price condition against IBKR live price; extrapolate intraday volume to full-session equivalent | Must |
-| SE-17 | Signal Engine | Intraday mode: apply per-run volume multipliers (13:30 → 1.8×, 14:30 → 1.6×, 15:30 → 1.5×) configurable in YAML | Must |
+| SE-17 | Signal Engine | Intraday mode: apply per-run volume multipliers (17:30 → 1.8×, 18:30 → 1.6×, 19:30 → 1.5×) configurable in YAML | Must |
 | SE-18 | Signal Engine | Intraday mode: reuse EMA chain, MACD, and market regime from EOD Parquet data — do not recalculate from partial intraday bars | Must |
 | SE-19 | Signal Engine | Intraday mode: re-validate R:R from scratch against live ask price at run time — R:R gate is never relaxed | Must |
 | SE-20 | Signal Engine | Maintain in-memory session rejection store: tickers rejected for compressed R:R in any intraday run are skipped in all subsequent intraday runs that session | Must |
