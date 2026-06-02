@@ -3,7 +3,7 @@ CLI entry point for the Signal Engine.
 
 Usage:
     python -m signal_engine                         # scan full watchlist
-    python -m signal_engine ASML.AS SIE.DE          # scan specific tickers
+    python -m signal_engine AAPL MSFT NVDA          # scan specific tickers
     python -m signal_engine --config /path/to.yaml  # custom config file
 
 What this does:
@@ -30,42 +30,24 @@ def _load_config(path: str) -> dict:
         return yaml.safe_load(fh)
 
 
-def _tickers_from_tsv(path: str) -> list[str]:
-    """Extract the ticker column from a tab-separated watchlist file.
-
-    The first column is the ticker.  The first row is a header and is skipped.
-    Empty lines and lines with an empty first column are ignored.
-    """
+def _tickers_from_file(path: str) -> list[str]:
+    """One ticker per line, no header. Lines starting with '#' are ignored."""
     lines = Path(path).read_text(encoding="utf-8").splitlines()
-    tickers = []
-    for line in lines[1:]:          # skip header row
-        parts = line.split("\t")
-        if parts and parts[0].strip():
-            tickers.append(parts[0].strip())
-    return tickers
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
 
 
 def _load_watchlist(config: dict) -> list[str]:
     """Build the full ticker list from all watchlist sources in config.yaml.
 
-    Sources (applied in order, duplicates removed):
-        1. eurostoxx600_file — static STOXX 600 constituents TSV
-        2. custom_file       — manually curated supplemental list TSV
-        3. watchlist.custom  — inline list of tickers in the YAML itself
-
-    dict.fromkeys preserves insertion order while deduplicating.
+    Any key ending in '_file' in the watchlist section is loaded automatically.
+    The inline 'custom' list is appended last. Duplicates are removed while
+    preserving insertion order.
     """
     wl = config.get("watchlist", {})
     tickers: list[str] = []
-
-    if wl.get("eurostoxx600_file"):
-        tickers.extend(_tickers_from_tsv(wl["eurostoxx600_file"]))
-
-    if wl.get("custom_file"):
-        path = wl["custom_file"]
-        if Path(path).exists():
-            tickers.extend(_tickers_from_tsv(path))
-
+    for key, path in wl.items():
+        if key.endswith("_file") and path and Path(path).exists():
+            tickers.extend(_tickers_from_file(path))
     tickers.extend(wl.get("custom", []))
     return list(dict.fromkeys(tickers))
 
@@ -100,7 +82,8 @@ def main() -> None:
 
     if not tickers:
         print(
-            "No tickers specified. Pass tickers as arguments or populate the watchlist in config.yaml.",
+                "No tickers specified. Pass tickers as arguments or populate "
+            "watchlist.nasdaq100_file / watchlist.sp500_file in config.yaml.",
             file=sys.stderr,
         )
         sys.exit(1)

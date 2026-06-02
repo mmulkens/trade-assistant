@@ -47,7 +47,7 @@ data_fetcher:
   workers: 8                    # Parallel threads per batch for fetching tickers
   batch_size: 16                # Tickers per batch; pause_seconds applied between batches
                                  # Keeps Yahoo Finance from rate-limiting the requests
-  batch_pause_seconds: 2        # Seconds to wait between batches
+  batch_pause_seconds: 1        # Seconds to wait between batches
   cache_dir: './cache'          # Directory for Parquet files (one file per ticker)
   max_retries: 3                # Retry attempts per ticker on transient fetch errors
   retry_backoff_seconds: 1.0    # Base wait between retries; multiplied by attempt number
@@ -72,7 +72,7 @@ signal_engine:
                                  # of the 52-week high — indicates a leadership stock
 
   # --- Market regime filter ---
-  benchmark: '^STOXX50E'        # Yahoo Finance ticker for the regime benchmark (Euro Stoxx 50)
+  benchmark: '^GSPC'            # Yahoo Finance ticker for the regime benchmark (S&P 500)
                                  # If benchmark closes below its 200 EMA → bear regime → no signals
 
   # --- MACD indicator (shared across both strategies) ---
@@ -155,10 +155,11 @@ orders:
 # Watchlist sources
 # -----------------------------------------------------------------------------
 watchlist:
-  eurostoxx600_file: './data_fetcher/tickers/eurostoxx600.txt'  # STOXX 600 constituents (298 tickers)
-  custom_file: './data_fetcher/tickers/eu_custom.txt'           # Manually curated supplemental list
+  nasdaq100_file: './data_fetcher/tickers/nasdaq100.txt'        # Nasdaq-100 constituents (~99 tickers)
+  sp500_file: './data_fetcher/tickers/sp500.txt'                # S&P 500 constituents (~499 tickers)
+  custom_file: './data_fetcher/tickers/custom.txt'              # Manually curated supplemental list
   custom: []                    # Inline list — add tickers here for quick one-off additions
-                                 # e.g. custom: ['SHOP.AS', 'ADYEN.AS']
+                                 # e.g. custom: ['TSLA', 'SMCI']
 
 
 # -----------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""
+﻿"""
 __main__.py — CLI entry point for the Data Fetcher.
 
 Usage
@@ -32,53 +32,34 @@ def _load_config(path: str) -> dict:
         return yaml.safe_load(fh)
 
 
-def _tickers_from_tsv(path: str) -> list[str]:
-    """
-    Extract ticker symbols from a tab-separated watchlist file.
-
-    Expected file format (header on line 1, data from line 2 onward):
-        ticker\tname\tcountry
-        ASML.AS\tASML HOLDING NV\tNL
-
-    Only the first column is read; blank lines are skipped.
-    """
+def _tickers_from_file(path: str) -> list[str]:
+    """One ticker per line, no header. Lines starting with '#' are ignored."""
     lines = Path(path).read_text(encoding="utf-8").splitlines()
-    tickers = []
-    for line in lines[1:]:   # skip the header row
-        parts = line.split("\t")
-        if parts and parts[0].strip():
-            tickers.append(parts[0].strip())
-    return tickers
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
 
 
 def _load_watchlist(config: dict) -> list[str]:
     """
     Build the full ticker list from config.yaml watchlist settings.
 
-    Sources combined in order (duplicates removed, order preserved):
-      1. eurostoxx600_file — TSV file with the 298 STOXX 600 constituents.
-      2. custom_file       — TSV file for manually curated EU names.
-      3. custom            — Inline YAML list for quick one-off additions.
+    Any key ending in '_file' in the watchlist section is treated as a ticker
+    file path and loaded automatically — adding a new source is a config-only
+    change.  Files that don't exist on disk are skipped silently.
+    The inline 'custom' list is appended last.
 
-    The benchmark ticker (^STOXX50E) is NOT included here — DataFetcher.run()
+    The benchmark ticker (^GSPC) is NOT included here — DataFetcher.run()
     always prepends it automatically.
     """
     wl = config.get("watchlist", {})
     tickers: list[str] = []
 
-    if wl.get("eurostoxx600_file"):
-        tickers.extend(_tickers_from_tsv(wl["eurostoxx600_file"]))
-
-    if wl.get("custom_file"):
-        path = wl["custom_file"]
-        # custom_file is optional; skip silently if it doesn't exist yet
-        if Path(path).exists():
-            tickers.extend(_tickers_from_tsv(path))
+    for key, path in wl.items():
+        if key.endswith("_file") and path and Path(path).exists():
+            tickers.extend(_tickers_from_file(path))
 
     tickers.extend(wl.get("custom", []))
 
-    # Preserve insertion order while removing any duplicates that arise from
-    # a ticker appearing in both eurostoxx600_file and custom
+    # dict.fromkeys preserves insertion order while removing cross-file duplicates
     return list(dict.fromkeys(tickers))
 
 
@@ -121,7 +102,7 @@ def main() -> None:
     if not tickers:
         print(
             "No tickers specified. Pass tickers as arguments, use --ticker-file, "
-            "or populate watchlist.eurostoxx600_file / watchlist.custom in config.yaml.",
+            "or populate watchlist.nasdaq_file / watchlist.nyse_file / watchlist.custom in config.yaml.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -154,3 +135,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
