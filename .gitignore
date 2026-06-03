@@ -22,3 +22,10 @@ venv/
 
 # Secrets / config overrides
 *.local.yaml
+
+# Misc
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+*.zip
