@@ -21,7 +21,8 @@
 13. [Design Consideration 12 — Reporting](#13-design-consideration-12--reporting)
 14. [Pre-Build Decisions & System Parameters](#14-pre-build-decisions--system-parameters)
 15. [Design Consideration 13 — IBKR Connectivity](#15-design-consideration-13--ibkr-connectivity)
-16. [Functional Requirements](#16-functional-requirements)
+16. [Design Consideration 14 — Walk-Forward Simulator](#16-design-consideration-14--walk-forward-simulator)
+17. [Functional Requirements](#17-functional-requirements)
 
 ---
 
@@ -48,9 +49,17 @@ Trade Assistant
     │
     ├── Position Manager     → ATR trail, cost floor, time-based exits, manual exit detection
     │
+    ├── Walk-Forward Simulator → strategy validation on historical data
+    │         ├── DataFrame Walker      (cache interception, lookahead prevention)
+    │         ├── Signal Engine         (reused unchanged via constructor injection)
+    │         ├── Risk Layer            (reused unchanged, isolated state DB)
+    │         ├── Sim Executor          (reused unchanged)
+    │         └── Sim Position Manager  (bar-by-bar exit simulation)
+    │
     ├── Logging Layer        → JSON lines + SQLite analytics DB
     │
-    ├── Report Generator     → per-trade diary, portfolio summary, annual tax export
+    ├── Report Generator     → per-trade diary, portfolio summary, annual tax export,
+    │                          WF equity curve and aggregate statistics
     │
     └── Notification Layer   → Telegram
 ```
@@ -89,10 +98,12 @@ The data fetcher is the foundation of the pipeline. It sources, caches, and main
 
 **Decision: Full fetch on day 1, delta append on subsequent runs**
 
-- Day 1: fetch full 300-day history per ticker
+- Day 1: fetch full 700-day history per ticker
 - Day 2+: fetch only missing days since last cached date, append to Parquet
-- Eliminates 299 redundant days of fetching on every run after initialisation
-- Performance: 300 tickers × 300 days serially = minutes; 300 tickers × 1–3 days in parallel = seconds
+- Eliminates 699 redundant days of fetching on every run after initialisation
+- Performance: 300 tickers × 700 days serially = minutes; 300 tickers × 1–3 days in parallel = seconds
+
+> **history_days set to 700** (increased from 300) to support the Walk-Forward Simulator, which requires a 200-bar indicator warmup plus a minimum of one full year (~252 trading days) of simulation depth. 700 calendar days ≈ 480 trading days, giving ~280 tradeable simulation days after warmup (~13 months). The live system is unaffected by having more history than it strictly needs. No separate WF-specific fetch config is required — one history depth serves both modes.
 
 Complexity managed:
 - Cache validation on load
@@ -780,7 +791,7 @@ costs:
   min_rr_after_costs: 2.0
 
 data_fetcher:
-  history_days: 300
+  history_days: 700      # extended from 300 — supports WF warmup + 1yr simulation
   workers: 8
   batch_size: 16
   batch_pause_seconds: 2
@@ -834,6 +845,9 @@ logging:
 reporting:
   report_dir: './reports'
   tax_year_start_month: 1   # January
+
+walk_forward:
+  db_path: './data/wf_sim.db'  # isolated from risk.db — never share these paths
 ```
 
 ---
@@ -1062,7 +1076,263 @@ These steps are performed once when the IBKR account is approved and Gateway is 
 
 ---
 
-## 16. Functional Requirements
+## 16. Design Consideration 14 — Walk-Forward Simulator
+
+The Walk-Forward Simulator (WF) replays the full Signal Engine → Risk Layer → Sim Executor → Sim Position Manager pipeline on historical OHLCV data, advancing one trading day at a time, to measure strategy performance without lookahead bias.
+
+It is not a throwaway prototype. It runs on demand via CLI and accumulates results across multiple runs in a persistent simulation database, enabling comparison between parameter configurations and strategy iterations.
+
+### A. Design Philosophy
+
+**Reuse, don't replicate.** Every existing component is called with its real logic unchanged. The WF module's job is to drive those components with a time-restricted view of historical data — not to re-implement their logic in a simulation context.
+
+The only genuinely new code is:
+- The **DataFrame Walker** — intercepts cache reads and returns truncated data
+- The **Sim Position Manager** — evaluates exit conditions bar by bar using historical OHLCV
+- The **day loop orchestrator** — advances the date cursor and coordinates component calls
+- The **storage layer** — writes results to `wf_sim.db`
+
+Everything else is reuse: Signal Engine, Risk Layer, Sim Executor, `pm_math` shared functions, Report Generator.
+
+### B. The DataFrame Walker
+
+The Walker is a drop-in replacement for the `data_fetcher.cache` module. It exposes the same interface — `load(ticker, cache_dir) → DataFrame` — but returns a truncated view: all rows where `date <= current_simulation_date`.
+
+The Signal Engine receives the Walker via constructor injection (SE-25). All cache reads during simulation flow through the Walker. This is the single enforcement point for lookahead prevention.
+
+**The Walker does not copy or modify Parquet files.** It reads from the same files as the live system and applies the date filter at read time. Full historical data always remains on disk.
+
+The Walker is testable in isolation: given a ticker, a cache directory, and a date, assert that the returned DataFrame's last index equals exactly that date.
+
+### C. Signal Engine Constructor Injection (SE-25)
+
+One small change to `signal_engine/engine.py` enables the Walker to be passed in:
+
+```python
+# Before
+def __init__(self, config: dict, logger: Logger) -> None:
+    # internally calls: cache_store.load(ticker, self._cache_dir)
+
+# After
+def __init__(self, config: dict, logger: Logger, cache=cache_store) -> None:
+    self._cache = cache
+    # internally calls: self._cache.load(ticker, self._cache_dir)
+```
+
+In production nothing changes — the default `cache=cache_store` means existing call sites require no modification. The Walk-Forward Simulator passes its Walker as `cache=walker`. The Signal Engine has no knowledge of the substitution.
+
+### D. Day Loop
+
+The simulator advances through contiguous trading days from `start_date` to `end_date`. On each iteration the loop is "between" two trading days: day D-1 has just closed, and day D is about to be revealed.
+
+```
+For each trading day D (from first warm day to end_date):
+
+    Step 1 — Signal Engine scans on D-1 close data
+        Walker is set to D-1; engine.scan(tickers) → raw signals
+
+    Step 2 — Rank signals
+        Elevated conviction first
+        Within same conviction tier: tightest stop distance % of entry
+
+    Step 3 — Risk Layer evaluates ranked signals
+        For each signal in ranked order:
+            RL.evaluate(signal) with simulated portfolio value and isolated DB
+            If approved: queue fill at P_close(D-1)
+            If rejected: record in wf_signals with reject reason
+
+    Step 4 — Reveal day D bar
+        Walker advances to D
+        For each queued fill:
+            If bar_D.low <= P_close(D-1) <= bar_D.high → entry confirmed at P_close(D-1)
+            Else (price gapped away) → entry skipped, record as 'rejected_gap'
+
+    Step 5 — Sim Position Manager evaluates ALL open positions against bar D
+        Check exits in this order (first match per position wins):
+            1. Gap stop:     bar_D.open <= active_stop → exit at bar_D.open
+            2. Intraday stop: bar_D.low <= active_stop → exit at active_stop
+            3. Trail trigger: bar_D.close >= entry + 1.5R → activate trail,
+                              move stop to cost floor, begin trail from running_high
+            4. Trail update:  trail active AND bar_D.high > running_high →
+                              recalculate atr_trail_stop, update active_stop upward only
+            5. Time exit:     hold_days >= 7 AND trail not active →
+                              evaluate conditions → exit at bar_D.close if met
+
+    Step 6 — Update simulated portfolio value
+        portfolio_value += sum(net_pnl) for positions closed this iteration
+
+    Step 7 — Store equity curve row
+        wf_equity_curve: (run_id, date=D, portfolio_value, open_positions, open_risk_pct)
+```
+
+**Why signals first, exits second:** the EOD scan fires on the prior day's close, before day D opens. Entries are queued at that close price. Exits resolve during day D's session. A position opened at D-1's close and stopped out on day D's bar is a real and correctly captured outcome.
+
+**Gap check on entry:** if day D's bar does not overlap P_close(D-1), the entry is skipped — we do not chase gaps. The signal is discarded; the engine may re-fire it on a subsequent day if the setup remains valid.
+
+**Daily loss limit:** the Risk Layer's RL-06 pause flag is date-scoped and resets automatically on a new calendar day. In the simulator each loop iteration is a complete session, so the flag resets between iterations naturally. No special WF handling needed.
+
+### E. Exit Fill Assumptions
+
+**Gap-aware stop fill — single mode, no configuration needed.**
+
+```python
+if bar_D.open <= active_stop:
+    exit_price = bar_D.open        # gapped through stop overnight
+elif bar_D.low <= active_stop:
+    exit_price = active_stop       # stop hit intraday
+```
+
+If the stock opens below the stop (overnight gap), the fill is at the open. If it trades through the stop intraday, the fill is at the stop price. No optimistic "always fill at stop" assumption.
+
+### F. Signal Ranking
+
+When multiple signals compete for a constrained risk budget, signals are processed in this priority order:
+
+1. **Elevated conviction** before standard conviction
+2. Within the same conviction tier: **tightest stop distance % of entry** first
+
+Rationale for tightest-stop priority: a compact stop indicates a lower-volatility, higher-quality setup and consumes less risk budget, leaving room for additional positions.
+
+### G. Sim Position Manager
+
+The Sim PM implements the same exit logic as the live Position Manager but driven by historical OHLCV bars rather than live price events. It is a **separate module** from the live PM — the live PM is event-driven (IBKR callbacks), while the Sim PM is a deterministic bar-by-bar function. Combining them would add simulation-specific branches to production code with no production benefit.
+
+**Shared pure functions:** ATR multiplier lookup, cost floor calculation, and active stop computation are extracted into a shared `pm_math.py` module imported by both the live PM and the Sim PM. Exit logic is not duplicated — only the data delivery mechanism differs.
+
+**Zero-day stop-out detection:** if a position opens and stops out on the same bar D, this is logged explicitly as a data quality warning. It indicates the stop was placed above the day's low, which the signal engine's structural stop logic should prevent.
+
+### H. State Isolation
+
+Each WF run uses an isolated SQLite database (`./data/wf_sim.db` by default, separate from `risk.db`). The live system state is never read or written during a simulation run.
+
+**Safety assert on startup:** the simulator aborts if `wf.db_path == risk.db_path`. One wrong config value must never corrupt live state.
+
+The simulated portfolio value is injected into the Risk Layer via the same `portfolio_value_stub` config path. It updates after each day's exits are resolved, so the next iteration's Risk Layer calls see the current simulated portfolio value.
+
+### I. History Depth and Warmup
+
+**Minimum cache depth:** 700 calendar days (set globally in `data_fetcher.history_days`).
+
+**Warmup:** the Signal Engine's `self._min_bars` is the binding constraint (EMA200 = 200 bars). The Walker skips any day D where fewer than `min_bars` of data exist for the benchmark ticker. The simulation summary reports warmup days skipped and the first effective simulation date explicitly.
+
+**Effective simulation depth with a 700-day cache:**
+- ~480 trading days total
+- ~200 bars warmup
+- ~280 tradeable simulation days (~13 months)
+
+### J. Intraday Signals
+
+Intraday Strategy B runs are not simulated in v1. All simulated signals are EOD only (`run_type: eod`). Intraday execution quality (live price at run time, volume extrapolation) cannot be reliably reconstructed from daily OHLCV. This is a known limitation, documented in the module README and recorded in the `wf_runs` metadata table per run.
+
+### K. Storage Schema
+
+All simulation data is stored in `wf_sim.db`. Multiple runs accumulate in the same database, each identified by a UUID `run_id`. This enables comparison across runs and parameter configurations without re-running.
+
+**`wf_runs` — one row per simulation run:**
+
+| Field | Description |
+|---|---|
+| `run_id` | UUID generated at run start |
+| `start_date` | First simulation day requested |
+| `effective_start_date` | First day after warmup — actual first day simulated |
+| `end_date` | Last simulation day |
+| `starting_portfolio_value` | Initial simulated portfolio value |
+| `final_portfolio_value` | Portfolio value at end of simulation |
+| `config_snapshot` | Full `config.yaml` serialised as JSON |
+| `run_timestamp` | Wall-clock time the simulation was executed (UTC) |
+| `universe_size` | Number of tickers in the watchlist |
+| `trading_days_simulated` | Count of days the cursor advanced |
+| `intraday_simulated` | Always `0` in v1 |
+| Aggregate stats | Populated at run end — see Section L |
+
+**`wf_signals` — every signal evaluated, all outcomes:**
+
+| Field | Description |
+|---|---|
+| `run_id` | FK to `wf_runs` |
+| `signal_date` | Day D-1 (the close date that generated the signal) |
+| `ticker` | Instrument ticker |
+| `signal_type` | `pullback` / `breakout` / `pullback+breakout` |
+| `conviction` | `standard` / `elevated` |
+| `entry_price` | Signal entry price (D-1 close) |
+| `stop_price` | Technical stop at signal time |
+| `stop_pct` | Stop distance as % of entry |
+| `target_price` | 2:1 R:R target |
+| `strategy_a_fired` | Boolean |
+| `strategy_b_fired` | Boolean |
+| `outcome` | `filled` / `rejected_risk` / `rejected_gap` / `rejected_duplicate` / `rejected_budget` |
+| `reject_reason` | RL reject reason code if `outcome = rejected_risk` |
+
+**`wf_positions` — same schema as `risk_positions`, plus `run_id`:**
+
+Full `risk_positions` schema plus `run_id` and `r_multiple` (net_pnl / initial_risk_amount). This enables the existing Report Generator to produce per-trade HTML diaries and tax CSV exports from simulation data without modification.
+
+**`wf_equity_curve` — daily portfolio value per run:**
+
+| Field | Description |
+|---|---|
+| `run_id` | FK to `wf_runs` |
+| `date` | Simulation day D |
+| `portfolio_value` | Portfolio value at end of day D (after exits resolved) |
+| `open_positions` | Count of open positions at end of day D |
+| `open_risk_pct` | Total open risk % at end of day D |
+
+### L. Aggregate Output
+
+Printed at run end and stored in `wf_runs`:
+
+| Metric | Description |
+|---|---|
+| Total trades | Count of all closed positions |
+| Win rate | % of trades with net_pnl > 0 |
+| Average R multiple | Mean of net_pnl / initial_risk_amount |
+| Expectancy | (win_rate × avg_win_R) − (loss_rate × avg_loss_R) |
+| Max consecutive losses | Longest losing streak |
+| Max drawdown | Largest peak-to-trough decline in simulated equity curve |
+| Exit reason breakdown | Count and % by `trail_hit` / `stop_hit` / `time_exit` |
+| Strategy breakdown | Count and avg R by strategy_a / strategy_b / both |
+| Signal conversion rate | Signals fired vs signals filled |
+| Gap rejection rate | Signals skipped due to entry gap |
+| Average hold duration | Mean trading days per closed trade |
+
+### M. CLI Interface
+
+```bash
+# Run full simulation on cached data
+python -m walk_forward_simulator
+
+# Specify date range
+python -m walk_forward_simulator --start 2025-01-01 --end 2026-01-01
+
+# Custom starting portfolio value
+python -m walk_forward_simulator --portfolio 100000
+
+# Dry run — advance cursor and log, no writes to wf_sim.db
+python -m walk_forward_simulator --dry-run
+
+# Print aggregate summary for a specific run
+python -m walk_forward_simulator --summary <run_id>
+
+# List all stored runs with key metrics
+python -m walk_forward_simulator --list-runs
+
+# Custom config
+python -m walk_forward_simulator --config /path/to/config.yaml
+```
+
+### N. Known Limitations (v1)
+
+Documented in the module README and stored in the `wf_runs` metadata per run:
+
+- Entry slippage not modelled — all entries fill at EOD close price
+- Intraday signals not simulated — EOD only
+- Transaction costs use flat TOB estimate (0.35%), not actual IBKR commission schedule
+- Market impact of simulated trades on price not modelled
+- EMA200 warmup reduces effective simulation window by ~200 bars (~10 months)
+
+---
+
+## 17. Functional Requirements
 
 Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) · **Could** (deferrable)
 
@@ -1073,7 +1343,7 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | ID | Component | Requirement | Priority |
 |---|---|---|---|
 | DF-01 | Data Fetcher | Fetch daily OHLCV data for all watchlist instruments using yfinance | Must |
-| DF-02 | Data Fetcher | On first run: fetch full 300-day history per ticker | Must |
+| DF-02 | Data Fetcher | On first run: fetch full 700-day history per ticker | Must |
 | DF-03 | Data Fetcher | On subsequent runs: delta load — fetch only missing days since last cached date | Must |
 | DF-04 | Data Fetcher | Cache OHLCV in Parquet format, one file per ticker in `cache/` directory | Must |
 | DF-05 | Data Fetcher | Validate cache on load: detect duplicate rows, date gaps, dtype consistency | Must |
@@ -1112,6 +1382,7 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | SE-22 | Signal Engine | Tickers that fail the price condition intraday (no longer above 50-day high) are NOT added to the rejection store — a clean breakout later in the session is a fresh signal | Must |
 | SE-23 | Signal Engine | Add `run_type` field ('eod' \| 'intraday') to signal payload; add `reference_price` field (EOD close used for stop/target calculation) | Must |
 | SE-24 | Signal Engine | Log intraday run results: tickers evaluated, skipped (with reason), signals fired, rejection store additions | Must |
+| SE-25 | Signal Engine | Accept optional `cache` parameter in constructor (default: real `cache_store`); use `self._cache.load()` internally — enables DataFrame Walker injection for walk-forward simulation without any other Signal Engine code changes | Must |
 
 ### Risk Layer
 
@@ -1240,6 +1511,37 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | SI-08 | Infrastructure | All development and staging against paper trading account before live deployment | Must |
 | SI-09 | Infrastructure | Dedicated direct IBKR account for bot — separate from Mexem manual account | Must |
 | SI-10 | Infrastructure | All system parameters in YAML config — no magic numbers in code | Must |
+
+### Walk-Forward Simulator
+
+| ID | Component | Requirement | Priority |
+|---|---|---|---|
+| WF-01 | Walk-Forward Simulator | Advance a date cursor through contiguous trading days from `start_date` to `end_date`; on each day present only data up to that date to all downstream components | Must |
+| WF-02 | Walk-Forward Simulator | Implement DataFrame Walker: drop-in replacement for `data_fetcher.cache` exposing the same `load(ticker, cache_dir)` interface; returns `df[df.index <= current_date]` — no Parquet files modified | Must |
+| WF-03 | Walk-Forward Simulator | Inject DataFrame Walker into Signal Engine via constructor parameter (SE-25); no other Signal Engine code changes | Must |
+| WF-04 | Walk-Forward Simulator | Skip warmup days: do not begin simulation until `min_bars` of data exist for the benchmark; log warmup days skipped and first effective simulation date in run summary | Must |
+| WF-05 | Walk-Forward Simulator | Day loop order per iteration: (1) signal engine scans on D-1 close, (2) rank signals, (3) risk layer evaluates, (4) reveal bar D and confirm/reject entries on gap check, (5) sim PM evaluates all open positions against bar D, (6) update portfolio value, (7) store equity curve row | Must |
+| WF-06 | Walk-Forward Simulator | Signal ranking: elevated conviction first; within same tier, tightest stop distance % of entry first | Must |
+| WF-07 | Walk-Forward Simulator | Gap check on entry: if bar_D does not overlap P_close(D-1), skip entry and record outcome as `rejected_gap` in `wf_signals` | Must |
+| WF-08 | Walk-Forward Simulator | Gap-aware exit fill: `exit_price = bar_D.open` if `bar_D.open <= active_stop`; else `exit_price = active_stop` if `bar_D.low <= active_stop` | Must |
+| WF-09 | Walk-Forward Simulator | Implement Sim Position Manager: evaluate stop hit, trail trigger, trail update, and time exit conditions for each open position on each bar D | Must |
+| WF-10 | Walk-Forward Simulator | Sim PM exit priority order per bar: (1) gap stop, (2) intraday stop, (3) trail trigger, (4) trail update, (5) time exit | Must |
+| WF-11 | Walk-Forward Simulator | Extract shared ATR multiplier lookup, cost floor calculation, and active stop computation into `pm_math.py`; import in both live PM and Sim PM — no logic duplication | Must |
+| WF-12 | Walk-Forward Simulator | Log zero-day stop-outs (position opened and closed on same bar) as explicit data quality warnings | Should |
+| WF-13 | Walk-Forward Simulator | Use isolated SQLite database (`wf_sim.db`) for all simulation state; never read or write `risk.db` during a simulation run | Must |
+| WF-14 | Walk-Forward Simulator | Assert on startup that `wf.db_path != risk.db_path`; abort with clear error message if equal | Must |
+| WF-15 | Walk-Forward Simulator | Inject simulated portfolio value into Risk Layer via `portfolio_value_stub` config path; update after each day's exits are resolved | Must |
+| WF-16 | Walk-Forward Simulator | Store every signal evaluated (all outcomes) in `wf_signals` table with `run_id`, `outcome`, and `reject_reason` | Must |
+| WF-17 | Walk-Forward Simulator | Store every closed position in `wf_positions` table using full `risk_positions` schema plus `run_id` and `r_multiple` | Must |
+| WF-18 | Walk-Forward Simulator | Store daily equity curve in `wf_equity_curve` table: `run_id`, `date`, `portfolio_value`, `open_positions`, `open_risk_pct` | Must |
+| WF-19 | Walk-Forward Simulator | Store run metadata in `wf_runs` table including full config snapshot, date range, universe size, trading days simulated, and aggregate statistics | Must |
+| WF-20 | Walk-Forward Simulator | Accumulate multiple runs in `wf_sim.db` identified by `run_id` — never overwrite prior runs | Must |
+| WF-21 | Walk-Forward Simulator | Print and store aggregate statistics at run end: total trades, win rate, average R, expectancy, max drawdown, max consecutive losses, exit reason breakdown, strategy breakdown, signal conversion rate, gap rejection rate, average hold duration | Must |
+| WF-22 | Walk-Forward Simulator | Support CLI flags: `--start`, `--end`, `--portfolio`, `--dry-run`, `--summary <run_id>`, `--list-runs`, `--config` | Must |
+| WF-23 | Walk-Forward Simulator | Dry-run mode: advance cursor, evaluate signals, log outcomes, make no writes to `wf_sim.db` | Must |
+| WF-24 | Walk-Forward Simulator | Do not simulate intraday signals in v1; all simulated signals are `run_type='eod'`; document as known limitation in module README and `wf_runs` metadata | Must |
+| WF-25 | Walk-Forward Simulator | `wf_positions` schema is compatible with the Report Generator — per-trade HTML diaries and tax CSV exports can be generated from simulation data without Report Generator code changes | Must |
+| WF-26 | Walk-Forward Simulator | `history_days` set to 700 globally in `data_fetcher` config; no separate WF-specific fetch config needed | Must |
 
 ---
 
