@@ -41,9 +41,9 @@ costs:
 # -----------------------------------------------------------------------------
 data_fetcher:
   provider: 'yfinance'          # OHLCV data provider — 'yfinance' (default) or 'eodhd'
-  history_days: 300             # Calendar days of OHLCV history to fetch per ticker
-                                 # 300 days ≈ 210 trading bars — sufficient for all indicators
-                                 # (EMA200 needs ~200 bars; 52-week high needs ~252 trading bars)
+  history_days: 700             # Calendar days of OHLCV history to fetch per ticker
+                                 # 700 days ≈ 490 trading bars — extended for walk-forward simulation
+                                 # (EMA200 warmup ~200 bars + meaningful simulation runway)
   workers: 8                    # Parallel threads per batch for fetching tickers
   batch_size: 16                # Tickers per batch; pause_seconds applied between batches
                                  # Keeps Yahoo Finance from rate-limiting the requests
@@ -175,6 +175,17 @@ sim_executor:
 notifications:
   telegram_bot_token: ''        # Bot token from @BotFather — leave empty to disable notifications
   telegram_chat_id: ''          # Target chat ID (your personal chat or a group)
+
+
+# -----------------------------------------------------------------------------
+# Walk-Forward Simulator
+# -----------------------------------------------------------------------------
+walk_forward:
+  wf_db_path: './data/wf_sim.db'  # SQLite database for simulation state (wf_runs, wf_positions,
+                                    # wf_signals, wf_equity_curve) and Risk Layer tables during a run
+  min_warmup_bars: 200              # Simulation skips days until benchmark has this many bars
+                                    # (EMA200 requires ~200 bars to be meaningful)
+  min_ticker_days: 700              # Tickers with fewer calendar days of cache are skipped
 
 
 # -----------------------------------------------------------------------------

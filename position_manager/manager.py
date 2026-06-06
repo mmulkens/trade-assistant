@@ -46,7 +46,7 @@ import pandas as pd
 from signal_engine import indicators
 from risk_layer import state as rl_state
 
-from . import trail as tr
+from utils import pm_math as pm
 from . import state as pm_state
 from . import notify
 
@@ -258,13 +258,13 @@ class PositionManager:
         current_atr = float(atr_series.iloc[-1])
         atr_pct = current_atr / current_price * 100.0
 
-        bucket = tr.classify_volatility_bucket(
+        bucket = pm.classify_volatility_bucket(
             atr_pct,
             self._atr_buckets["low_threshold_pct"],
             self._atr_buckets["high_threshold_pct"],
         )
-        multiplier = tr.get_atr_multiplier(bucket, self._atr_buckets)
-        cost_floor = tr.calc_cost_floor(pos["entry_price"], self._tob_pct)
+        multiplier = pm.atr_multiplier(bucket, self._atr_buckets)
+        cost_floor = pm.cost_floor(pos["entry_price"], pos["shares"], self._tob_pct)
 
         self._logger.info({
             "event": "position_evaluated",
@@ -321,14 +321,14 @@ class PositionManager:
         ticker = pos["ticker"]
 
         # --- A. Check trail trigger ---
-        if tr.is_trail_trigger_reached(
+        if pm.trail_trigger_reached(
             current_price,
             pos["entry_price"],
             pos["risk_per_share"],
             self._trail_trigger_r,
         ):
-            atr_trail_level = tr.calc_atr_trail_level(current_peak, current_atr, multiplier)
-            new_stop = tr.calc_active_stop(cost_floor, atr_trail_level)
+            trail_level = pm.atr_trail_level(current_peak, current_atr, multiplier)
+            new_stop = pm.active_stop(cost_floor, trail_level)
 
             # Stop only moves up — if somehow the trail calc is below the
             # existing stop (e.g. an unusually wide ATR on activation day),
@@ -349,7 +349,7 @@ class PositionManager:
                 "ticker": ticker,
                 "trigger_price": current_price,
                 "cost_floor": cost_floor,
-                "atr_trail_level": atr_trail_level,
+                "atr_trail_level": trail_level,
                 "new_stop": new_stop,
                 "running_high": current_peak,
                 "volatility_bucket": bucket,
@@ -411,8 +411,8 @@ class PositionManager:
         ticker = pos["ticker"]
         current_stop = pos["stop_price"]
 
-        atr_trail_level = tr.calc_atr_trail_level(current_peak, current_atr, multiplier)
-        new_stop = tr.calc_active_stop(cost_floor, atr_trail_level)
+        trail_level = pm.atr_trail_level(current_peak, current_atr, multiplier)
+        new_stop = pm.active_stop(cost_floor, trail_level)
 
         if new_stop <= current_stop:
             # Trail has not risen — no action needed today
@@ -420,7 +420,7 @@ class PositionManager:
                 "event": "trail_no_change",
                 "ticker": ticker,
                 "current_stop": current_stop,
-                "recalculated_trail": atr_trail_level,
+                "recalculated_trail": trail_level,
                 "active_stop_candidate": new_stop,
                 "running_high": current_peak,
             })
@@ -436,7 +436,7 @@ class PositionManager:
             "ticker": ticker,
             "old_stop": current_stop,
             "new_stop": new_stop,
-            "atr_trail_level": atr_trail_level,
+            "atr_trail_level": trail_level,
             "running_high": current_peak,
             "new_risk_amount": new_risk_amount,
         })
@@ -447,7 +447,7 @@ class PositionManager:
                 old_stop=current_stop,
                 new_stop=new_stop,
                 running_high=current_peak,
-                atr_trail_level=atr_trail_level,
+                atr_trail_level=trail_level,
                 bot_token=self._bot_token,
                 chat_id=self._chat_id,
                 logger=self._logger,
@@ -489,7 +489,7 @@ class PositionManager:
             return
 
         # --- Condition 3: price must be near the stop ---
-        proximity = tr.calc_stop_proximity_ratio(
+        proximity = pm.stop_proximity_ratio(
             current_price, pos["stop_price"], pos["entry_price"]
         )
         is_near_stop = proximity <= (self._stop_proximity_pct / 100.0)

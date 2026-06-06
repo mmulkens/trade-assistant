@@ -91,8 +91,9 @@ class SignalEngine:
     exclusive) and triggers an elevated conviction annotation.
     """
 
-    def __init__(self, config: dict, logger: Logger) -> None:
+    def __init__(self, config: dict, logger: Logger, cache=cache_store) -> None:
         self._logger = logger
+        self._cache = cache
         se = config["signal_engine"]
 
         # Shared indicator parameters — used to compute series passed to both strategies
@@ -151,7 +152,7 @@ class SignalEngine:
         """
         # Determine market regime before scanning any individual ticker.
         # The benchmark DataFrame is also reused for RS line annotations.
-        benchmark_df = cache_store.load(self._benchmark, self._cache_dir)
+        benchmark_df = self._cache.load(self._benchmark, self._cache_dir)
         if benchmark_df is None or len(benchmark_df) < 200:
             self._logger.warning({
                 "event": "benchmark_missing_or_short",
@@ -202,7 +203,7 @@ class SignalEngine:
         regime: str,
     ) -> Optional[Signal]:
         """Evaluate a single ticker. Returns a Signal or None."""
-        df = cache_store.load(ticker, self._cache_dir)
+        df = self._cache.load(ticker, self._cache_dir)
         if df is None or len(df) < self._min_bars:
             self._logger.debug({
                 "event": "signal_skipped",

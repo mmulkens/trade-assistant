@@ -64,8 +64,8 @@ Trade Assistant
     ├── Notification Layer   → Telegram
     │
     └── Shared Utilities     → pure functions used by more than one component
-              └── pm_math.py → ATR multiplier, cost floor, active stop (Position Manager + Sim PM)
-              └── json_logger.py → called for writing logs
+              └── utils/pm_math.py → ATR multiplier, cost floor, active stop (Position Manager + Sim PM)
+              └── utils/json_logger.py → called for writing logs
 ```
 
 > **Key coupling:** The Signal Engine and Order Executor are tightly coupled at the R:R validation step. A signal must pass stop and target levels so the executor can perform the full cost-inclusive R:R calculation before touching the market.
@@ -864,7 +864,9 @@ reporting:
   tax_year_start_month: 1   # January
 
 walk_forward:
-  db_path: './data/wf_sim.db'  # isolated from risk.db — never share these paths
+  wf_db_path: './data/wf_sim.db'  # isolated from risk.db — never share these paths
+  min_warmup_bars: 200             # bars required on benchmark before sim begins (EMA200 warmup)
+  min_ticker_days: 700             # minimum calendar days of cache for a ticker to be eligible
 ```
 
 ---
@@ -1231,6 +1233,8 @@ Each WF run uses an isolated SQLite database (`./data/wf_sim.db` by default, sep
 
 **Safety assert on startup:** the simulator aborts if `wf.db_path == risk.db_path`. One wrong config value must never corrupt live state.
 
+**Single-file isolation (v1 implementation):** `wf_sim.db` holds both the WF-specific tables (`wf_runs`, `wf_positions`, `wf_signals`, `wf_equity_curve`) and the Risk Layer's standard tables (`risk_positions`, `system_state`). The RiskLayer is instantiated with a deep-copied config where `risk.db_path` is overridden to `wf_db_path`. RL tables are cleared at the start of each run so every simulation begins from clean state; WF-specific tables accumulate across runs (identified by `run_id`).
+
 The simulated portfolio value is injected into the Risk Layer via the same `portfolio_value_stub` config path. It updates after each day's exits are resolved, so the next iteration's Risk Layer calls see the current simulated portfolio value.
 
 ### I. History Depth and Warmup
@@ -1322,27 +1326,20 @@ Printed at run end and stored in `wf_runs`:
 ### M. CLI Interface
 
 ```bash
-# Run full simulation on cached data
-python -m walk_forward_simulator
+# Run full simulation on configured watchlist (nasdaq100 + sp500 + custom)
+python -m walk_forward
 
-# Specify date range
-python -m walk_forward_simulator --start 2025-01-01 --end 2026-01-01
-
-# Custom starting portfolio value
-python -m walk_forward_simulator --portfolio 100000
-
-# Dry run — advance cursor and log, no writes to wf_sim.db
-python -m walk_forward_simulator --dry-run
-
-# Print aggregate summary for a specific run
-python -m walk_forward_simulator --summary <run_id>
+# Explicit subcommand (same as above)
+python -m walk_forward run
 
 # List all stored runs with key metrics
-python -m walk_forward_simulator --list-runs
+python -m walk_forward runs
 
-# Custom config
-python -m walk_forward_simulator --config /path/to/config.yaml
+# Print aggregate summary for a specific run
+python -m walk_forward summary <run_id>
 ```
+
+> **v1 implementation note:** The package name is `walk_forward` (not `walk_forward_simulator`). Date-range and portfolio flags (`--start`, `--end`, `--portfolio`, `--dry-run`) are not implemented in v1 — the simulation runs over the full available history and uses `portfolio_value_stub` from config. These can be added as CLI flags when needed.
 
 ### O. Positions Open at End Date
 
