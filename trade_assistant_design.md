@@ -61,10 +61,16 @@ Trade Assistant
     ├── Report Generator     → per-trade diary, portfolio summary, annual tax export,
     │                          WF equity curve and aggregate statistics
     │
-    └── Notification Layer   → Telegram
+    ├── Notification Layer   → Telegram
+    │
+    └── Shared Utilities     → pure functions used by more than one component
+              └── pm_math.py → ATR multiplier, cost floor, active stop (Position Manager + Sim PM)
+              └── json_logger.py → called for writing logs
 ```
 
 > **Key coupling:** The Signal Engine and Order Executor are tightly coupled at the R:R validation step. A signal must pass stop and target levels so the executor can perform the full cost-inclusive R:R calculation before touching the market.
+
+> **Utility module principle:** any logic consumed by more than one component is extracted into a shared utility module rather than duplicated or owned by either consumer. Utility modules contain only pure functions — no state, no I/O, no component dependencies. `pm_math.py` is the first instance of this pattern.
 
 ---
 
@@ -618,6 +624,17 @@ Position open
     ├── Stop hit at any point → close entire position (exit_reason: stop_hit)
     └── Position closed externally → detect + log (exit_reason: manual)
 ```
+
+### G. Shared Utility Module — pm_math.py
+
+The following pure functions are extracted from the Position Manager into a shared utility module (`pm_math.py`) so they can be reused by the Walk-Forward Simulator's Sim Position Manager without duplication:
+
+- `atr_multiplier(atr_pct, config)` — returns ATR trail multiplier based on volatility bucket classification
+- `cost_floor(entry_price, shares, tob_pct)` — returns minimum stop level covering round-trip transaction costs
+- `active_stop(cost_floor, atr_trail_stop)` — returns `max(cost_floor, atr_trail_stop)`
+- `atr_trail_level(running_high, atr_value, multiplier)` — returns `running_high - (atr_value × multiplier)`
+
+`pm_math.py` contains only pure functions — no state, no I/O, no dependencies on other components. This is the general pattern for all shared utilities in the system: logic consumed by more than one component lives in a utility module owned by neither.
 
 ---
 
