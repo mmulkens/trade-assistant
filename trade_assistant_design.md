@@ -1136,6 +1136,7 @@ For each trading day D (from first warm day to end_date):
         Within same conviction tier: tightest stop distance % of entry
 
     Step 3 — Risk Layer evaluates ranked signals
+        Uses portfolio_value from end of D-1 (previous iteration's Step 6)
         For each signal in ranked order:
             RL.evaluate(signal) with simulated portfolio value and isolated DB
             If approved: queue fill at P_close(D-1)
@@ -1148,8 +1149,9 @@ For each trading day D (from first warm day to end_date):
             Else (price gapped away) → entry skipped, record as 'rejected_gap'
 
     Step 5 — Sim Position Manager evaluates ALL open positions against bar D
+        ATR sourced from walker.load(ticker, cache_dir) truncated to D — no lookahead
         Check exits in this order (first match per position wins):
-            1. Gap stop:     bar_D.open <= active_stop → exit at bar_D.open
+            1. Gap stop:      bar_D.open <= active_stop → exit at bar_D.open
             2. Intraday stop: bar_D.low <= active_stop → exit at active_stop
             3. Trail trigger: bar_D.close >= entry + 1.5R → activate trail,
                               move stop to cost floor, begin trail from running_high
@@ -1158,12 +1160,15 @@ For each trading day D (from first warm day to end_date):
             5. Time exit:     hold_days >= 7 AND trail not active →
                               evaluate conditions → exit at bar_D.close if met
 
-    Step 6 — Update simulated portfolio value
+    Step 6 — Update simulated portfolio value (end-of-day, last step)
         portfolio_value += sum(net_pnl) for positions closed this iteration
+        This updated value is used by the Risk Layer in the next iteration's Step 3
 
     Step 7 — Store equity curve row
         wf_equity_curve: (run_id, date=D, portfolio_value, open_positions, open_risk_pct)
 ```
+
+**Portfolio value ordering:** the Risk Layer on day D always uses the portfolio value as it stood at the end of day D-1 (after D-1's exits were resolved). This is a clean end-of-day mark — no intraday portfolio value fluctuation is modelled.
 
 **Why signals first, exits second:** the EOD scan fires on the prior day's close, before day D opens. Entries are queued at that close price. Exits resolve during day D's session. A position opened at D-1's close and stopped out on day D's bar is a real and correctly captured outcome.
 
@@ -1196,6 +1201,8 @@ Rationale for tightest-stop priority: a compact stop indicates a lower-volatilit
 ### G. Sim Position Manager
 
 The Sim PM implements the same exit logic as the live Position Manager but driven by historical OHLCV bars rather than live price events. It is a **separate module** from the live PM — the live PM is event-driven (IBKR callbacks), while the Sim PM is a deterministic bar-by-bar function. Combining them would add simulation-specific branches to production code with no production benefit.
+
+**ATR sourcing:** the Sim PM reads the Parquet cache via the Walker on each bar evaluation — `ind.atr(walker.load(ticker, cache_dir), atr_period)` — so ATR is always computed on data truncated to bar D. This is the same pattern as the live Position Manager reading the cache directly. No lookahead is possible.
 
 **Shared pure functions:** ATR multiplier lookup, cost floor calculation, and active stop computation are extracted into a shared `pm_math.py` module imported by both the live PM and the Sim PM. Exit logic is not duplicated — only the data delivery mechanism differs.
 
@@ -1320,7 +1327,25 @@ python -m walk_forward_simulator --list-runs
 python -m walk_forward_simulator --config /path/to/config.yaml
 ```
 
-### N. Known Limitations (v1)
+### O. Positions Open at End Date
+
+If the simulation reaches `end_date` with positions still open, they are not force-closed. They are stored in `wf_positions` with `exit_date = NULL` and `status = 'open_at_end'`. Unrealised P&L is calculated against the last available bar's close price and stored as `unrealised_pnl`.
+
+The aggregate summary lists these positions separately. They are **excluded** from win rate, average R, expectancy, and exit reason breakdowns — including them would distort results since the outcome is unknown. Max drawdown and equity curve calculations use the last known portfolio value without marking these positions to market.
+
+### P. Universe Eligibility
+
+A ticker is eligible for simulation only if both conditions are met:
+
+1. **Full history:** the Parquet cache contains at least 700 calendar days of data. Tickers with shorter history are skipped and logged at run start. This applies primarily to recently listed stocks or recent index additions. Acknowledged as a mild survivorship bias — documented as a known limitation.
+
+2. **Current index membership:** the universe is the current S&P 500, Nasdaq 100, and Russell 2000 constituents as of the run date. No historical constituent tracking is performed in v1.
+
+**Data gaps within eligible tickers:** if a ticker's cache has a gap (trading halt, data quality issue), the gap is forward-filled with the last known bar before simulation begins. A warning is logged for each gap-filled ticker and recorded in `wf_runs`. The ticker remains eligible.
+
+**Future optimisation:** pre-computing all indicator series once per ticker across the full cache, then slicing into the simulation, would make reruns near-instant and eliminate repeated recalculation. Deferred to v2+ — for v1, indicators are recomputed from the truncated view on each simulation day.
+
+### Q. Known Limitations (v1)
 
 Documented in the module README and stored in the `wf_runs` metadata per run:
 
@@ -1329,6 +1354,9 @@ Documented in the module README and stored in the `wf_runs` metadata per run:
 - Transaction costs use flat TOB estimate (0.35%), not actual IBKR commission schedule
 - Market impact of simulated trades on price not modelled
 - EMA200 warmup reduces effective simulation window by ~200 bars (~10 months)
+- Survivorship bias: universe is current index constituents only; recently delisted or recently added stocks are not historically tracked
+- Positions open at `end_date` are excluded from aggregate performance statistics
+- No crash recovery — a mid-run crash requires a full rerun from `start_date`
 
 ---
 
@@ -1542,6 +1570,12 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | WF-24 | Walk-Forward Simulator | Do not simulate intraday signals in v1; all simulated signals are `run_type='eod'`; document as known limitation in module README and `wf_runs` metadata | Must |
 | WF-25 | Walk-Forward Simulator | `wf_positions` schema is compatible with the Report Generator — per-trade HTML diaries and tax CSV exports can be generated from simulation data without Report Generator code changes | Must |
 | WF-26 | Walk-Forward Simulator | `history_days` set to 700 globally in `data_fetcher` config; no separate WF-specific fetch config needed | Must |
+| WF-27 | Walk-Forward Simulator | Positions still open at `end_date` are stored in `wf_positions` with `exit_date = NULL`, `status = 'open_at_end'`, and `unrealised_pnl` calculated against last bar's close; excluded from win rate, avg R, expectancy, and exit reason statistics | Must |
+| WF-28 | Walk-Forward Simulator | Risk Layer on day D uses portfolio value from end of day D-1 (previous iteration's Step 6); portfolio value update is always the last step of each iteration | Must |
+| WF-29 | Walk-Forward Simulator | Sim PM sources ATR from `walker.load(ticker, cache_dir)` truncated to bar D — same pattern as live Position Manager reading the cache; no lookahead | Must |
+| WF-30 | Walk-Forward Simulator | Universe eligibility: include only tickers with at least 700 calendar days of Parquet cache data; skip and log ineligible tickers at run start | Must |
+| WF-31 | Walk-Forward Simulator | Universe scope: current S&P 500, Nasdaq 100, and Russell 2000 constituents as of run date; no historical constituent tracking in v1 | Must |
+| WF-32 | Walk-Forward Simulator | Data gaps in eligible tickers: forward-fill with last known bar before simulation begins; log a warning per gap-filled ticker and record in `wf_runs` | Must |
 
 ---
 
