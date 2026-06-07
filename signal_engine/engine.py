@@ -21,6 +21,7 @@ import pandas as pd
 
 from data_fetcher import cache as cache_store
 from . import indicators as ind
+from . import ranking as rk
 from .strategy_a import StrategyA
 from .strategy_b import StrategyB
 
@@ -67,6 +68,7 @@ class Signal:
     market_regime: str          # 'bull' | 'bear' | 'unknown' at scan time
     rs_value: Optional[float]   # Stock / benchmark ratio at signal time
     run_type: str = 'eod'       # 'eod' | 'intraday' — execution context for the signal
+    signal_rank: int = 0        # 1 = highest priority; assigned by scan() after ranking
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +149,9 @@ class SignalEngine:
         """Scan a list of tickers and return all qualifying signals.
 
         Returns an empty list if the market regime is bear.  Each ticker is
-        evaluated independently; signals are not ranked or filtered here —
-        that is the Risk Layer's responsibility.
+        evaluated independently.  Returned signals are ranked: elevated
+        conviction first, then tightest stop% within tier (signal_rank=1
+        is highest priority).
         """
         # Determine market regime before scanning any individual ticker.
         # The benchmark DataFrame is also reused for RS line annotations.
@@ -179,13 +182,17 @@ class SignalEngine:
             if result is not None:
                 signals.append(result)
 
+        ranked = rk.rank_signals(signals)
+        for i, signal in enumerate(ranked):
+            signal.signal_rank = i + 1
+
         self._logger.info({
             "event": "scan_complete",
             "tickers_scanned": len(tickers),
-            "signals_fired": len(signals),
+            "signals_fired": len(ranked),
             "regime": regime,
         })
-        return signals
+        return ranked
 
     # -----------------------------------------------------------------------
     # Private helpers

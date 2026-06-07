@@ -57,6 +57,7 @@ _COLUMNS: list[tuple[str, str, str]] = [
     ("market_regime",       "TEXT",               "'bull' | 'bear' | 'unknown' at scan time"),
     ("rs_value",            "REAL",               "stock / benchmark ratio at signal time"),
     ("run_type",            "TEXT",               "'eod' | 'intraday' — execution context"),
+    ("signal_rank",         "INTEGER",            "1 = highest priority; assigned by SE after ranking"),
     ("processed",           "INTEGER",            "1 once handled by SX or executor; NULL/0 = unprocessed"),
 ]
 
@@ -80,8 +81,8 @@ INSERT INTO signals (
     liquidity_class, conviction, earnings_flag, stop_capped,
     swing_low_stop, atr_stop, stop_method,
     strategy_a_fired, strategy_b_fired, near_52wk_high,
-    market_regime, rs_value, run_type
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    market_regime, rs_value, run_type, signal_rank
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 # ---------------------------------------------------------------------------
@@ -144,6 +145,7 @@ def save_signals(signals: list["Signal"], db_path: str) -> int:
             s.market_regime,
             s.rs_value,
             s.run_type,
+            s.signal_rank,
         )
         for s in signals
     ]

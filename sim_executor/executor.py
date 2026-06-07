@@ -160,7 +160,7 @@ class SimExecutor:
     # -----------------------------------------------------------------------
 
     def _fetch_unprocessed(self) -> list:
-        """Return all signals not yet handled, ordered by signal_timestamp.
+        """Return all signals not yet handled, ordered by signal rank.
 
         Uses IS NOT 1 rather than = 0 so that legacy rows with a NULL
         processed column (from a signals.db populated before this column was
@@ -170,7 +170,8 @@ class SimExecutor:
         with sqlite3.connect(self._signals_db) as conn:
             conn.row_factory = sqlite3.Row
             return conn.execute(
-                "SELECT * FROM signals WHERE processed IS NOT 1 ORDER BY signal_timestamp"
+                """SELECT * FROM signals WHERE processed IS NOT 1
+                   ORDER BY COALESCE(signal_rank, 99999), signal_timestamp"""
             ).fetchall()
 
     def _process_row(self, row: sqlite3.Row) -> None:
@@ -327,4 +328,5 @@ def _row_to_signal(row: sqlite3.Row) -> Signal:
         # run_type: NULL in rows written before this column was added;
         # default to 'eod' since all existing rows are EOD signals.
         run_type=row["run_type"] or "eod",
+        signal_rank=int(row["signal_rank"] or 0),
     )

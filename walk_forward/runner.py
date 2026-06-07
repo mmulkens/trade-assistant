@@ -42,7 +42,6 @@ from signal_engine.engine import SignalEngine
 from signal_engine import indicators as ind
 
 from . import storage
-from . import ranking as rk
 from .walker import DataFrameWalker
 from .sim_pm import SimPositionManager
 
@@ -177,9 +176,9 @@ class WalkForwardRunner:
             # Step 1 — Scan for signals (pure computation; no DB writes)
             # Signals are scanned before exits so the ranked list is available
             # as signal_queue for the time-exit gate in step 2.
+            # scan() returns signals already ranked (signal_rank=1 is best).
             # ---------------------------------------------------------------
-            signals = signal_engine.scan(eligible)
-            ranked  = rk.rank_signals(signals)
+            ranked = signal_engine.scan(eligible)
 
             # ---------------------------------------------------------------
             # Step 2 — Process exits for all positions open at start of day
@@ -284,6 +283,7 @@ class WalkForwardRunner:
                     conviction=signal.conviction,
                     entry_price=signal.entry_price,
                     stop_price=signal.stop_price,
+                    signal_rank=signal.signal_rank,
                     action=action,
                 )
 

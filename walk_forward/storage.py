@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS wf_signals (
     conviction  TEXT NOT NULL,
     entry_price REAL NOT NULL,
     stop_price  REAL NOT NULL,
+    signal_rank INTEGER NOT NULL,
     action      TEXT NOT NULL,
     FOREIGN KEY (run_id) REFERENCES wf_runs(run_id)
 )
@@ -239,6 +240,7 @@ def record_signal(
     conviction: str,
     entry_price: float,
     stop_price: float,
+    signal_rank: int,
     action: str,
 ) -> None:
     """Record a signal and the action taken (entered, skipped, etc.)."""
@@ -247,11 +249,11 @@ def record_signal(
             """
             INSERT INTO wf_signals
                 (run_id, signal_date, ticker, signal_type, conviction,
-                 entry_price, stop_price, action)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 entry_price, stop_price, signal_rank, action)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (run_id, signal_date, ticker, signal_type, conviction,
-             entry_price, stop_price, action),
+             entry_price, stop_price, signal_rank, action),
         )
         conn.commit()
 

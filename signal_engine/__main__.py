@@ -112,15 +112,15 @@ def main() -> None:
         if capped:
             print(f"⚠  {capped} signal(s) have stop at hard cap — wide stop, verify setup geometry")
         print(
-            f"\n{'Ticker':<14} {'Type':<22} {'Conv':<10} "
+            f"\n{'#':>3}  {'Ticker':<14} {'Type':<22} {'Conv':<10} "
             f"{'Entry':>8} {'Stop':>8} {'Target':>8} {'Risk%':>6}  {'Flag'}"
         )
-        print("-" * 90)
+        print("-" * 94)
         for s in signals:
             risk_pct = (s.entry_price - s.stop_price) / s.entry_price * 100
             flag = "⚠ CAP" if s.stop_capped else ""
             print(
-                f"{s.ticker:<14} {s.signal_type:<22} {s.conviction:<10} "
+                f"{s.signal_rank:>3}  {s.ticker:<14} {s.signal_type:<22} {s.conviction:<10} "
                 f"{s.entry_price:>8.2f} {s.stop_price:>8.2f} {s.target_price:>8.2f} "
                 f"{risk_pct:>5.1f}%  {flag}"
             )
