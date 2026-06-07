@@ -228,6 +228,7 @@ class WalkForwardRunner:
                             gross_pnl=result.gross_pnl,
                             net_pnl=result.net_pnl,
                             exit_reason=result.exit_reason,
+                            gap_filled=result.gap_filled,
                         )
                         del ticker_to_wf_id[ticker]
 

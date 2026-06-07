@@ -2,7 +2,7 @@
 # sim_pm.py — SimPositionManager: per-bar position evaluation for simulation
 #
 # Responsibilities:
-#   - Gap-aware stop fill: exit at bar.open if open <= stop (gap down through stop)
+#   - Gap-aware stop fill: exit at bar.open if open <= stop; sets gap_filled=True on ExitResult
 #   - Intraday stop fill: exit at stop if bar.low <= stop
 #   - ATR trailing stop advancement when trail is active
 #   - Trail trigger detection and activation at 1.5R
@@ -39,12 +39,13 @@ class ExitResult:
 
     closed: bool
     exit_price: float = 0.0
-    exit_reason: str = ""          # 'gap_down' | 'stop_hit' | 'time_exit'
+    exit_reason: str = ""          # 'stop_hit' | 'trail_stop' | 'time_exit'
     gross_pnl: float = 0.0
     net_pnl: float = 0.0
     exit_commission: float = 0.0
     new_stop: float = 0.0          # updated stop (only relevant when closed=False)
     trail_activated: bool = False  # True on the first bar the trail trigger fires
+    gap_filled: bool = False       # True when filled at bar.open (open gapped below stop)
 
 
 class SimPositionManager:
@@ -112,13 +113,16 @@ class SimPositionManager:
         bar_low   = float(bar["low"])
         bar_close = float(bar["close"])
 
-        # --- Gap-down through stop (WF-32) ---
+        # --- Gap-down through stop ---
+        # Fill at bar open (worse than stop). Reason reflects whether trail was active.
         if bar_open <= stop_price:
-            return self._make_exit(entry_price, bar_open, shares, "gap_down")
+            reason = "trail_stop" if trail_on else "stop_hit"
+            return self._make_exit(entry_price, bar_open, shares, reason, gap_filled=True)
 
         # --- Intraday stop hit ---
         if bar_low <= stop_price:
-            return self._make_exit(entry_price, stop_price, shares, "stop_hit")
+            reason = "trail_stop" if trail_on else "stop_hit"
+            return self._make_exit(entry_price, stop_price, shares, reason)
 
         # --- No stop hit; evaluate trail / time-exit ---
         new_stop       = stop_price
@@ -213,6 +217,7 @@ class SimPositionManager:
         exit_price: float,
         shares: int,
         reason: str,
+        gap_filled: bool = False,
     ) -> ExitResult:
         """Compute round-trip P&L and return a closed ExitResult."""
         gross_pnl        = round((exit_price - entry_price) * shares, 4)
@@ -226,6 +231,7 @@ class SimPositionManager:
             gross_pnl=gross_pnl,
             net_pnl=net_pnl,
             exit_commission=exit_commission,
+            gap_filled=gap_filled,
         )
 
     # -----------------------------------------------------------------------

@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS wf_positions (
     gross_pnl       REAL,
     net_pnl         REAL,
     exit_reason     TEXT,
+    gap_filled      INTEGER DEFAULT 0,
     signal_type     TEXT,
     conviction      TEXT,
     FOREIGN KEY (run_id) REFERENCES wf_runs(run_id)
@@ -92,12 +93,18 @@ CREATE TABLE IF NOT EXISTS wf_equity_curve (
 
 
 def init_db(db_path: str) -> None:
-    """Create all WF-specific tables if they do not exist."""
+    """Create all WF-specific tables if they do not exist, then forward-migrate."""
     with sqlite3.connect(db_path) as conn:
         conn.execute(_CREATE_WF_RUNS)
         conn.execute(_CREATE_WF_POSITIONS)
         conn.execute(_CREATE_WF_SIGNALS)
         conn.execute(_CREATE_WF_EQUITY)
+
+        # Forward migration: add new columns to existing tables without touching data
+        existing_pos = {row[1] for row in conn.execute("PRAGMA table_info(wf_positions)")}
+        if "gap_filled" not in existing_pos:
+            conn.execute("ALTER TABLE wf_positions ADD COLUMN gap_filled INTEGER DEFAULT 0")
+
         conn.commit()
 
 
@@ -190,6 +197,7 @@ def record_position_close(
     gross_pnl: float,
     net_pnl: float,
     exit_reason: str,
+    gap_filled: bool = False,
 ) -> None:
     """Update a position record when it closes."""
     with sqlite3.connect(db_path) as conn:
@@ -197,11 +205,11 @@ def record_position_close(
             """
             UPDATE wf_positions
                SET exit_date = ?, exit_price = ?, exit_commission = ?,
-                   gross_pnl = ?, net_pnl = ?, exit_reason = ?
+                   gross_pnl = ?, net_pnl = ?, exit_reason = ?, gap_filled = ?
              WHERE id = ?
             """,
             (exit_date, exit_price, exit_commission, gross_pnl, net_pnl,
-             exit_reason, position_db_id),
+             exit_reason, int(gap_filled), position_db_id),
         )
         conn.commit()
 

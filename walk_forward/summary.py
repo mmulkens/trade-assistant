@@ -31,7 +31,7 @@ def calculate_summary(db_path: str, run_id: str) -> dict:
         run = dict(run_row)
 
         pos_rows = conn.execute(
-            """SELECT net_pnl, entry_date, exit_date, exit_reason
+            """SELECT net_pnl, entry_date, exit_date, exit_reason, gap_filled
                  FROM wf_positions
                 WHERE run_id = ? AND exit_date IS NOT NULL""",
             (run_id,),
@@ -86,6 +86,8 @@ def calculate_summary(db_path: str, run_id: str) -> dict:
         reason = p.get("exit_reason") or "unknown"
         exit_reasons[reason] = exit_reasons.get(reason, 0) + 1
 
+    gap_fills = sum(1 for p in positions if p.get("gap_filled"))
+
     return {
         "run_id":            run_id,
         "sim_start":         run["sim_start"],
@@ -101,6 +103,7 @@ def calculate_summary(db_path: str, run_id: str) -> dict:
         "max_drawdown_pct":  round(max_drawdown_pct, 2),
         "avg_holding_days":  round(avg_holding_days, 1),
         "exit_reasons":      exit_reasons,
+        "gap_fills":         gap_fills,
     }
 
 
@@ -131,6 +134,8 @@ def print_summary(s: dict) -> None:
         print(f"\n  Exit reasons:")
         for reason, count in sorted(s["exit_reasons"].items()):
             print(f"    {reason:<20s} {count}")
+    if s.get("gap_fills"):
+        print(f"  Gap fills:           {s['gap_fills']}  (filled at open, not stop)")
 
     print(f"\n{sep}\n")
 
