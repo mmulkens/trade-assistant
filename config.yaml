@@ -23,6 +23,10 @@ risk:
   thin_size_multiplier: 0.5     # Thin instruments receive this fraction of the standard position
                                  # size (RL-09) — 0.5 = half size for names with low liquidity
 
+  min_position_risk_pct: 0.3   # Minimum risk as % of portfolio for any single trade
+                                 # Prevents entering with a trivial position when only a small
+                                 # sliver of the 6% open-risk room remains (e.g. $300 on $100k)
+
   db_path: './data/risk.db'     # SQLite database for open positions, realised P&L, system state
 
 

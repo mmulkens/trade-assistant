@@ -29,6 +29,7 @@ def size_position(
     max_position_risk_pct: float,
     liquidity_class: str,
     thin_size_multiplier: float,
+    max_risk_amount_override: float | None = None,
 ) -> SizingResult:
     """Calculate position size so that risk stays within the per-trade cap.
 
@@ -48,6 +49,13 @@ def size_position(
         Committing a full 1.5% to an illiquid name understates the true cost of
         the trade.  Halving the position (thin_size_multiplier = 0.5) reduces
         sizing to 0.75% risk while still allowing the trade to be taken.
+
+    `max_risk_amount_override` bypasses the percentage-based cap and sizes
+    directly to the supplied dollar amount.  Used by the partial-fill path in
+    RiskLayer.evaluate() when remaining open-risk room is smaller than the
+    standard per-trade cap.  The thin_size_multiplier is still applied on top
+    so thin instruments never consume more than their proportional share of
+    the remaining room.
     """
     risk_per_share = entry - stop
 
@@ -61,15 +69,21 @@ def size_position(
             effective_cap_pct=0.0,
         )
 
-    # Apply the thin-instrument reduction before calculating shares.
-    # Liquid names use the full cap; thin names use cap × thin_size_multiplier.
-    effective_cap_pct = (
-        max_position_risk_pct * thin_size_multiplier
-        if liquidity_class == "thin"
-        else max_position_risk_pct
-    )
-
-    max_risk_amount = portfolio_value * (effective_cap_pct / 100)
+    if max_risk_amount_override is not None:
+        # Partial-fill path: use the supplied dollar cap directly.
+        # Still apply the thin multiplier — thin instruments are half-sized
+        # even when filling remaining room.
+        multiplier = thin_size_multiplier if liquidity_class == "thin" else 1.0
+        max_risk_amount = max_risk_amount_override * multiplier
+        effective_cap_pct = (max_risk_amount / portfolio_value) * 100
+    else:
+        # Normal path: derive cap from percentage config.
+        effective_cap_pct = (
+            max_position_risk_pct * thin_size_multiplier
+            if liquidity_class == "thin"
+            else max_position_risk_pct
+        )
+        max_risk_amount = portfolio_value * (effective_cap_pct / 100)
 
     # floor() ensures actual risk never exceeds the hard cap (see docstring)
     shares = floor(max_risk_amount / risk_per_share)

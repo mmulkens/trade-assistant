@@ -72,11 +72,12 @@ class RiskLayer:
     def __init__(self, config: dict, logger: Logger) -> None:
         self._logger = logger
         rl = config["risk"]
-        self._max_position_risk_pct: float = rl["max_position_risk_pct"]   # RL-01: 1.5%
-        self._max_open_risk_pct: float = rl["max_open_risk_pct"]           # RL-02: 6.0%
-        self._daily_loss_limit_pct: float = rl["daily_loss_limit_pct"]     # RL-06: 3.0%
-        self._portfolio_value_stub: float = rl["portfolio_value_stub"]     # Phase 1 stub (RL-04)
-        self._thin_size_multiplier: float = rl.get("thin_size_multiplier", 0.5)  # RL-09
+        self._max_position_risk_pct: float = rl["max_position_risk_pct"]        # RL-01: 1.5%
+        self._max_open_risk_pct: float = rl["max_open_risk_pct"]              # RL-02: 6.0%
+        self._daily_loss_limit_pct: float = rl["daily_loss_limit_pct"]        # RL-06: 3.0%
+        self._min_position_risk_pct: float = rl.get("min_position_risk_pct", 0.3)  # floor: 0.3%
+        self._portfolio_value_stub: float = rl["portfolio_value_stub"]        # Phase 1 stub (RL-04)
+        self._thin_size_multiplier: float = rl.get("thin_size_multiplier", 0.5)    # RL-09
         self._db_path: str = rl["db_path"]
 
     # -----------------------------------------------------------------------
@@ -173,10 +174,19 @@ class RiskLayer:
         # -------------------------------------------------------------------
         # Check 4 — Position sizing (RL-03, RL-09)
         #
-        # Calculate the number of shares we can buy so that the risk
-        # (entry − stop) × shares stays within the per-trade cap.
-        # Thin instruments receive a reduced cap (RL-09).
+        # Size to the LOWER of the per-trade cap and the remaining open-risk
+        # room.  This means every signal is sized to whatever capacity is
+        # currently available — the per-trade cap (1.5%) is the maximum, not
+        # the default.  A signal never gets skipped because of a smaller
+        # footprint relative to a lower-ranked signal.
+        #
+        # Thin instruments receive a further reduction (RL-09): the effective
+        # cap is multiplied by thin_size_multiplier inside size_position().
         # -------------------------------------------------------------------
+        standard_max_risk = portfolio_value * self._max_position_risk_pct / 100
+        remaining_room    = portfolio_value * self._max_open_risk_pct / 100 - current_open_risk_amount
+        effective_max_risk = min(standard_max_risk, remaining_room)
+
         sizing = calc.size_position(
             entry=signal.entry_price,
             stop=signal.stop_price,
@@ -184,24 +194,31 @@ class RiskLayer:
             max_position_risk_pct=self._max_position_risk_pct,
             liquidity_class=signal.liquidity_class,
             thin_size_multiplier=self._thin_size_multiplier,
+            max_risk_amount_override=effective_max_risk,
         )
 
-        # shares == 0 means risk_per_share is larger than the entire risk budget
-        # (extremely wide stop relative to portfolio size).  Cannot size.
         if sizing.shares == 0:
+            if remaining_room <= 0:
+                return _reject(
+                    f"open_risk_cap_exceeded:"
+                    f"no_room_remaining:{current_open_risk_pct:.3f}pct_vs_limit_{self._max_open_risk_pct}pct"
+                )
             return _reject("zero_shares:risk_per_share_too_large_or_invalid_prices")
 
+        # Minimum position size: skip trivially small entries when only a sliver
+        # of the 6% room remains.  Prevents e.g. a $200-risk position on a $100k
+        # portfolio when the effective cap is reduced by a small remaining room.
+        if sizing.position_risk_pct < self._min_position_risk_pct:
+            return _reject(
+                f"below_min_position_size:"
+                f"{sizing.position_risk_pct:.3f}pct_vs_min_{self._min_position_risk_pct}pct"
+            )
+
         # -------------------------------------------------------------------
-        # Check 5 — Per-trade hard cap (RL-01): max 1.5% per trade
+        # Check 5 — Per-trade hard cap safety net (RL-01): max 1.5% per trade
         #
-        # floor() in size_position() mathematically guarantees we cannot
-        # exceed the cap.  This explicit check acts as a safety net against
-        # any future changes to size_position() that might inadvertently
-        # produce oversized results.  The 0.001% tolerance covers floating-
-        # point rounding in the final percentage calculation.
-        #
-        # This rule is NEVER overridden — it is the outermost guard on
-        # individual position risk.
+        # effective_max_risk guarantees we cannot exceed this, but the explicit
+        # check guards against floating-point drift and future edits to sizing.
         # -------------------------------------------------------------------
         if sizing.position_risk_pct > self._max_position_risk_pct + 0.001:
             return _reject(
@@ -210,20 +227,15 @@ class RiskLayer:
             )
 
         # -------------------------------------------------------------------
-        # Check 6 — Total open risk hard cap (RL-02): max 6% across all trades
+        # Check 6 — Total open risk safety net (RL-02): max 6% across all trades
         #
-        # Projects what total open risk would be if this trade is added.
-        # If it would push the aggregate over 6%, the signal is dropped even
-        # though it would be valid on its own.  When this cap is hit, the
-        # session is considered "fully invested" from a risk perspective —
-        # new signals should wait for existing positions to be closed.
-        #
-        # This rule is NEVER overridden.
+        # effective_max_risk (capped at remaining_room) makes this check
+        # almost always a no-op.  Kept as a floating-point safety net.
         # -------------------------------------------------------------------
         projected_open_risk_pct = calc.open_risk_pct(
             current_open_risk_amount + sizing.risk_amount, portfolio_value
         )
-        if projected_open_risk_pct > self._max_open_risk_pct:
+        if projected_open_risk_pct > self._max_open_risk_pct + 0.001:
             return _reject(
                 f"open_risk_cap_exceeded:"
                 f"projected_{projected_open_risk_pct:.3f}pct_vs_limit_{self._max_open_risk_pct}pct"
