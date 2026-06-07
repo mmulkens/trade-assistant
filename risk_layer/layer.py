@@ -317,7 +317,13 @@ class RiskLayer:
         })
         return row_id
 
-    def close_position(self, ticker: str, close_price: float, reason: str) -> bool:
+    def close_position(
+        self,
+        ticker: str,
+        close_price: float,
+        reason: str,
+        closed_at: str | None = None,
+    ) -> bool:
         """Record a position close and calculate realised P&L.
 
         `reason` must be one of: 'stop' | 'target' | 'trail' | 'manual'.
@@ -326,8 +332,11 @@ class RiskLayer:
 
         After a close, the realised P&L feeds into get_daily_realized_pnl()
         which is used by Check 3 (daily loss limit) on the next evaluate() call.
+
+        `closed_at` is forwarded to rl_state — pass the sim date in WF runs so
+        daily P&L accumulates per simulated day rather than per real wall-clock day.
         """
-        updated = st.close_position(ticker, close_price, reason, self._db_path)
+        updated = st.close_position(ticker, close_price, reason, self._db_path, closed_at)
         if updated:
             self._logger.info({
                 "event": "position_closed",

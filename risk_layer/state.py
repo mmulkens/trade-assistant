@@ -182,6 +182,7 @@ def close_position(
     close_price: float,
     reason: str,
     db_path: str,
+    closed_at: Optional[str] = None,
 ) -> bool:
     """Mark the most recent open position for `ticker` as closed.
 
@@ -192,13 +193,19 @@ def close_position(
     Returns False if no open position exists for this ticker — the caller
     (RiskLayer.close_position) logs a warning in that case.
 
+    `closed_at` defaults to the current UTC time.  Pass an ISO-format date
+    string (e.g. "2025-04-29T00:00:00+00:00") in walk-forward simulation so
+    that daily P&L calculations use the simulated date, not the real wall-clock
+    date — otherwise get_daily_realized_pnl() accumulates all sim-day closes
+    into a single real day and fires the daily loss limit permanently.
+
     Why ORDER BY opened_at DESC LIMIT 1?
         Under normal operation there is only one open position per ticker
         (the duplicate check in evaluate() prevents pyramiding).  The ORDER BY
         is a safety net in case state is corrected manually and a second row
         somehow exists — we always close the most recently opened one.
     """
-    closed_at = datetime.now(timezone.utc).isoformat()
+    closed_at = closed_at or datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
             "SELECT id, entry_price, shares FROM risk_positions "

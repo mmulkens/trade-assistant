@@ -171,6 +171,11 @@ class WalkForwardRunner:
             date_str = date.strftime("%Y-%m-%d")
             walker.advance(date)
 
+            # Reset the daily loss limit flag so each sim day is independent.
+            # In live trading the pause expires at midnight; we mirror that here
+            # so a bad sim day does not permanently halt subsequent simulation days.
+            rl_state.clear_trading_pause(self._wf_db_path)
+
             # ---------------------------------------------------------------
             # Step 1 — Scan for signals (pure computation; no DB writes)
             # Signals are scanned before exits so the ranked list is available
@@ -214,7 +219,8 @@ class WalkForwardRunner:
                 )
 
                 if result.closed:
-                    risk_layer.close_position(ticker, result.exit_price, result.exit_reason)
+                    sim_closed_at = date_str + "T00:00:00+00:00"
+                    risk_layer.close_position(ticker, result.exit_price, result.exit_reason, sim_closed_at)
 
                     wf_pos_id = ticker_to_wf_id.get(ticker)
                     if wf_pos_id is not None:
@@ -352,7 +358,7 @@ class WalkForwardRunner:
             exit_commission  = round(close_price  * shares * tob_pct / 100, 4)
             net_pnl          = round(gross_pnl - entry_commission - exit_commission, 4)
 
-            rl_state.close_position(ticker, close_price, "sim_end", self._wf_db_path)
+            rl_state.close_position(ticker, close_price, "sim_end", self._wf_db_path, sim_end + "T00:00:00+00:00")
 
             wf_pos_id = ticker_to_wf_id.get(ticker)
             if wf_pos_id is not None:
