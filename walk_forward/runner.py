@@ -4,9 +4,9 @@
 # Responsibilities:
 #   - Enforce state isolation (wf_sim.db ≠ risk.db at startup)
 #   - Build and configure all pipeline components for the simulation
-#   - Drive the day loop: advance walker → scan → exit → enter → equity record
+#   - Drive the day loop: scan on D-1 → advance to D → enter → exit → equity
 #   - Route P&L from exits back into portfolio_value for the next day's sizing
-#   - Mark open positions as sim_end at the end of the run
+#   - Leave open positions as-is at sim end (exit_date=NULL, excluded from P&L)
 #   - Persist the full run record to wf_sim.db for summary analysis
 #
 # Components used:
@@ -18,8 +18,12 @@
 #     stop/trail/peak updates (mirrors what the live Position Manager does)
 #
 # Key design decisions:
-#   - Signals are scanned BEFORE exits so the ranked list is available as
-#     signal_queue for the time-exit gate on the same bar.
+#   - Scan runs while walker is still at D-1 so entry_price = D-1's close.
+#     Walker advances to D afterwards; entries and exits both use D's bar.
+#   - Entries precede exits: orders placed at/near D's open, PM evaluates
+#     the full session (including positions opened that same morning).
+#   - Gap check on entry: if bar_D.low > limit_price → 'rejected_gap', no fill.
+#     Gap-down (bar_D.low ≤ limit_price): fill at limit_price (D-1 close × 1.005).
 #   - portfolio_value_stub is kept current by mutating the wf_config dict and
 #     the RiskLayer instance (_portfolio_value_stub) after every exit.
 #   - RL state tables are cleared at run start so each simulation starts clean.
@@ -29,7 +33,7 @@ from __future__ import annotations
 
 import copy
 import sqlite3
-from datetime import datetime, timezone
+
 from logging import Logger
 from pathlib import Path
 
@@ -166,26 +170,125 @@ class WalkForwardRunner:
         # Day loop
         # =======================================================================
         tob_pct: float = float(wf_config["costs"]["tob_pct"])
+        entry_buffer_pct: float = float(wf_config["orders"]["entry_buffer_pct"])
+
+        # Seed walker to the last bar before the first sim day so that the
+        # first scan() call sees D-1 data (not D's bar, which hasn't opened yet).
+        walker.advance(sim_dates[0] - pd.Timedelta(days=1))
+        prev_date_str: str = (sim_dates[0] - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
         for date in sim_dates:
             date_str = date.strftime("%Y-%m-%d")
-            walker.advance(date)
 
-            # Reset the daily loss limit flag so each sim day is independent.
-            # In live trading the pause expires at midnight; we mirror that here
-            # so a bad sim day does not permanently halt subsequent simulation days.
+            # Reset the daily loss limit flag — mirrors live trading where it expires at midnight.
             rl_state.clear_trading_pause(self._wf_db_path)
 
             # ---------------------------------------------------------------
-            # Step 1 — Scan for signals (pure computation; no DB writes)
-            # Signals are scanned before exits so the ranked list is available
-            # as signal_queue for the time-exit gate in step 2.
+            # Step 1 — Scan for signals on D-1 data
+            # Walker is still at prev_date (D-1); engine.scan() sees D-1's
+            # close as df.iloc[-1]. entry_price = D-1's close for all signals.
             # scan() returns signals already ranked (signal_rank=1 is best).
             # ---------------------------------------------------------------
             ranked = signal_engine.scan(eligible)
 
+            # Advance walker to D — all subsequent bar reads expose today's OHLCV.
+            walker.advance(date)
+
             # ---------------------------------------------------------------
-            # Step 2 — Process exits for all positions open at start of day
+            # Step 2 — Try to enter signals queued from D-1's scan
+            # limit_price = entry_price × (1 + entry_buffer_pct / 100)
+            #   (D-1's close × 1.005 — the marketable limit order price)
+            # Gap-up miss:  bar_D.low > limit_price → 'rejected_gap', no fill.
+            # Gap-down/flat: bar_D.low ≤ limit_price → fill at limit_price.
+            # ---------------------------------------------------------------
+            open_tickers = {p["ticker"] for p in rl_state.get_open_positions(self._wf_db_path)}
+
+            for signal in ranked:
+                if signal.ticker in open_tickers:
+                    continue  # already open from a prior day
+
+                decision = risk_layer.evaluate(signal)
+
+                stop_pct = (
+                    round((signal.entry_price - signal.stop_price) / signal.entry_price * 100, 4)
+                    if signal.entry_price > 0 else None
+                )
+
+                # Determine fill outcome: RL gate first, then gap check on D's bar.
+                fill_price: float | None = None
+                if not decision.approved:
+                    action = f"skipped:{decision.reject_reason}"
+                else:
+                    limit_price = round(signal.entry_price * (1 + entry_buffer_pct / 100), 4)
+                    df_today = walker.load(signal.ticker, self._cache_dir)
+                    if df_today is None or len(df_today) == 0:
+                        action = "skipped:no_bar_on_fill_day"
+                    elif float(df_today.iloc[-1]["low"]) > limit_price:
+                        action = "rejected_gap"
+                    else:
+                        action = "entered"
+                        fill_price = limit_price
+
+                storage.record_signal(
+                    db_path=self._wf_db_path,
+                    run_id=run_id,
+                    signal_date=prev_date_str,
+                    ticker=signal.ticker,
+                    signal_type=signal.signal_type,
+                    conviction=signal.conviction,
+                    entry_price=signal.entry_price,
+                    stop_price=signal.stop_price,
+                    stop_pct=stop_pct,
+                    target_price=signal.target_price,
+                    stop_type=signal.stop_method,
+                    signal_rank=signal.signal_rank,
+                    action=action,
+                )
+
+                if fill_price is None:
+                    continue
+
+                entry_commission = round(fill_price * decision.shares * tob_pct / 100, 4)
+
+                risk_layer.open_position(
+                    decision=decision,
+                    fill_price=fill_price,
+                    fill_timestamp=date_str + "T00:00:00+00:00",
+                    entry_commission=entry_commission,
+                    bot_initiated=True,
+                    peak_price=fill_price,
+                )
+
+                wf_pos_id = storage.record_position_open(
+                    db_path=self._wf_db_path,
+                    run_id=run_id,
+                    ticker=signal.ticker,
+                    entry_date=date_str,
+                    entry_price=fill_price,
+                    stop_price=signal.stop_price,
+                    shares=decision.shares,
+                    risk_amount=decision.risk_amount,
+                    entry_commission=entry_commission,
+                    signal_type=signal.signal_type,
+                    conviction=signal.conviction,
+                )
+                ticker_to_wf_id[signal.ticker] = wf_pos_id
+                open_tickers.add(signal.ticker)
+                total_trades += 1
+
+                logger.info({
+                    "event": "wf_entry",
+                    "run_id": run_id,
+                    "date": date_str,
+                    "ticker": signal.ticker,
+                    "fill_price": fill_price,
+                    "shares": decision.shares,
+                    "risk_amount": decision.risk_amount,
+                    "conviction": signal.conviction,
+                })
+
+            # ---------------------------------------------------------------
+            # Step 3 — Process exits for all open positions (incl. today's entries)
             # ---------------------------------------------------------------
             open_positions = rl_state.get_open_positions(self._wf_db_path)
 
@@ -195,7 +298,7 @@ class WalkForwardRunner:
                 if df is None or len(df) < self._atr_period + 1:
                     continue  # no data for today; hold, re-evaluate tomorrow
 
-                today_bar    = df.iloc[-1]
+                today_bar     = df.iloc[-1]
                 current_price = float(today_bar["close"])
 
                 # Update peak_price in DB if today set a new high
@@ -269,112 +372,19 @@ class WalkForwardRunner:
                         pm_state.activate_trail(ticker, current_price, self._wf_db_path)
 
             # ---------------------------------------------------------------
-            # Step 3 — Try to enter approved signals
-            # ---------------------------------------------------------------
-            open_tickers = {p["ticker"] for p in rl_state.get_open_positions(self._wf_db_path)}
-
-            for signal in ranked:
-                if signal.ticker in open_tickers:
-                    continue  # already open from a prior day
-
-                decision = risk_layer.evaluate(signal)
-                action   = "entered" if decision.approved else f"skipped:{decision.reject_reason}"
-
-                storage.record_signal(
-                    db_path=self._wf_db_path,
-                    run_id=run_id,
-                    signal_date=date_str,
-                    ticker=signal.ticker,
-                    signal_type=signal.signal_type,
-                    conviction=signal.conviction,
-                    entry_price=signal.entry_price,
-                    stop_price=signal.stop_price,
-                    signal_rank=signal.signal_rank,
-                    action=action,
-                )
-
-                if not decision.approved:
-                    continue
-
-                fill_price       = signal.entry_price
-                entry_commission = round(fill_price * decision.shares * tob_pct / 100, 4)
-
-                risk_layer.open_position(
-                    decision=decision,
-                    fill_price=fill_price,
-                    fill_timestamp=datetime.now(timezone.utc).isoformat(),
-                    entry_commission=entry_commission,
-                    bot_initiated=True,
-                    peak_price=fill_price,
-                )
-
-                wf_pos_id = storage.record_position_open(
-                    db_path=self._wf_db_path,
-                    run_id=run_id,
-                    ticker=signal.ticker,
-                    entry_date=date_str,
-                    entry_price=fill_price,
-                    stop_price=signal.stop_price,
-                    shares=decision.shares,
-                    risk_amount=decision.risk_amount,
-                    entry_commission=entry_commission,
-                    signal_type=signal.signal_type,
-                    conviction=signal.conviction,
-                )
-                ticker_to_wf_id[signal.ticker] = wf_pos_id
-                open_tickers.add(signal.ticker)
-                total_trades += 1
-
-                logger.info({
-                    "event": "wf_entry",
-                    "run_id": run_id,
-                    "date": date_str,
-                    "ticker": signal.ticker,
-                    "fill_price": fill_price,
-                    "shares": decision.shares,
-                    "risk_amount": decision.risk_amount,
-                    "conviction": signal.conviction,
-                })
-
-            # ---------------------------------------------------------------
             # Step 4 — Daily equity snapshot
             # ---------------------------------------------------------------
             n_open = len(rl_state.get_open_positions(self._wf_db_path))
             storage.record_equity(self._wf_db_path, run_id, date_str, portfolio_value, n_open)
 
+            # Advance D-1 tracker for the next iteration's scan and signal_date.
+            prev_date_str = date_str
+
         # =======================================================================
-        # Simulation complete — mark remaining open positions as sim_end
+        # Simulation complete — positions still open are left as-is (exit_date=NULL).
+        # They are excluded from P&L statistics by summary.py (WHERE exit_date IS NOT NULL).
         # =======================================================================
-        for pos in rl_state.get_open_positions(self._wf_db_path):
-            ticker = pos["ticker"]
-            df     = walker.load(ticker, self._cache_dir)
-            close_price = float(df.iloc[-1]["close"]) if (df is not None and len(df) > 0) \
-                          else float(pos["entry_price"])
-
-            shares      = int(pos["shares"])
-            entry_price = float(pos["entry_price"])
-            gross_pnl        = round((close_price - entry_price) * shares, 4)
-            entry_commission = round(entry_price * shares * tob_pct / 100, 4)
-            exit_commission  = round(close_price  * shares * tob_pct / 100, 4)
-            net_pnl          = round(gross_pnl - entry_commission - exit_commission, 4)
-
-            rl_state.close_position(ticker, close_price, "sim_end", self._wf_db_path, sim_end + "T00:00:00+00:00")
-
-            wf_pos_id = ticker_to_wf_id.get(ticker)
-            if wf_pos_id is not None:
-                storage.record_position_close(
-                    db_path=self._wf_db_path,
-                    position_db_id=wf_pos_id,
-                    exit_date=sim_end,
-                    exit_price=close_price,
-                    exit_commission=exit_commission,
-                    gross_pnl=gross_pnl,
-                    net_pnl=net_pnl,
-                    exit_reason="sim_end",
-                )
-
-            portfolio_value += net_pnl
-            total_trades    += 1
+        open_at_end = len(rl_state.get_open_positions(self._wf_db_path))
 
         # Final run record update
         storage.close_run(self._wf_db_path, run_id, portfolio_value, total_trades)
@@ -385,6 +395,7 @@ class WalkForwardRunner:
             "portfolio_start": float(self._config["risk"]["portfolio_value_stub"]),
             "portfolio_end": round(portfolio_value, 2),
             "total_trades": total_trades,
+            "open_at_end": open_at_end,
         })
 
         return run_id

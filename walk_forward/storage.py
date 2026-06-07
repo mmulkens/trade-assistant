@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS wf_signals (
     conviction  TEXT NOT NULL,
     entry_price REAL NOT NULL,
     stop_price  REAL NOT NULL,
+    stop_pct    REAL,
+    target_price REAL,
+    stop_type   TEXT,
     signal_rank INTEGER NOT NULL,
     action      TEXT NOT NULL,
     FOREIGN KEY (run_id) REFERENCES wf_runs(run_id)
@@ -104,6 +107,14 @@ def init_db(db_path: str) -> None:
         existing_pos = {row[1] for row in conn.execute("PRAGMA table_info(wf_positions)")}
         if "gap_filled" not in existing_pos:
             conn.execute("ALTER TABLE wf_positions ADD COLUMN gap_filled INTEGER DEFAULT 0")
+
+        existing_sig = {row[1] for row in conn.execute("PRAGMA table_info(wf_signals)")}
+        if "stop_pct" not in existing_sig:
+            conn.execute("ALTER TABLE wf_signals ADD COLUMN stop_pct REAL")
+        if "target_price" not in existing_sig:
+            conn.execute("ALTER TABLE wf_signals ADD COLUMN target_price REAL")
+        if "stop_type" not in existing_sig:
+            conn.execute("ALTER TABLE wf_signals ADD COLUMN stop_type TEXT")
 
         conn.commit()
 
@@ -248,6 +259,9 @@ def record_signal(
     conviction: str,
     entry_price: float,
     stop_price: float,
+    stop_pct: float | None,
+    target_price: float | None,
+    stop_type: str | None,
     signal_rank: int,
     action: str,
 ) -> None:
@@ -257,11 +271,13 @@ def record_signal(
             """
             INSERT INTO wf_signals
                 (run_id, signal_date, ticker, signal_type, conviction,
-                 entry_price, stop_price, signal_rank, action)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 entry_price, stop_price, stop_pct, target_price, stop_type,
+                 signal_rank, action)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (run_id, signal_date, ticker, signal_type, conviction,
-             entry_price, stop_price, signal_rank, action),
+             entry_price, stop_price, stop_pct, target_price, stop_type,
+             signal_rank, action),
         )
         conn.commit()
 
