@@ -118,6 +118,9 @@ signal_engine:
   # --- Output ---
   db_path: './data/signals.db'  # SQLite database for persisting all fired signals
 
+  regime_filter: true           # Set false to disable the bear-regime gate (for WF experiments)
+                                 # Default true — live runs always respect the regime filter
+
 
 # -----------------------------------------------------------------------------
 # Position Manager

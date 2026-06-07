@@ -126,6 +126,7 @@ class SignalEngine:
 
         # Market regime benchmark
         self._benchmark: str = se["benchmark"]
+        self._regime_filter: bool = bool(se.get("regime_filter", True))
         self._cache_dir: str = config["data_fetcher"]["cache_dir"]
 
         # Instantiate strategy modules
@@ -168,7 +169,8 @@ class SignalEngine:
 
         # Bear regime gate: individual setups have much lower follow-through when
         # the broad index is below its 200 EMA — pause all signals.
-        if regime == "bear":
+        # Disabled when signal_engine.regime_filter: false (e.g. for WF experiments).
+        if self._regime_filter and regime == "bear":
             self._logger.info({
                 "event": "regime_filter_active",
                 "regime": "bear",

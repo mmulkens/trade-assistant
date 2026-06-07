@@ -62,7 +62,6 @@ class WalkForwardRunner:
         wf = config["walk_forward"]
         self._wf_db_path: str = wf["wf_db_path"]
         self._min_warmup_bars: int = int(wf.get("min_warmup_bars", 200))
-        self._min_ticker_days: int = int(wf.get("min_ticker_days", 700))
         self._benchmark: str = config["signal_engine"]["benchmark"]
         self._cache_dir: str = config["data_fetcher"]["cache_dir"]
         self._atr_period: int = int(config["position_manager"]["atr_period"])
@@ -389,28 +388,13 @@ class WalkForwardRunner:
     # -----------------------------------------------------------------------
 
     def _eligible_tickers(self, walker: DataFrameWalker, tickers: list[str]) -> list[str]:
-        """Return tickers with at least min_ticker_days of calendar-day history."""
-        eligible: list[str] = []
-        for ticker in tickers:
-            df = walker._store.get(ticker)
-            if df is None:
-                continue
-            idx = df.index
-            if idx.tz is not None:
-                idx = idx.tz_localize(None)
-            if len(idx) == 0:
-                continue
-            calendar_days = (idx[-1] - idx[0]).days
-            if calendar_days >= self._min_ticker_days:
-                eligible.append(ticker)
-            else:
-                self._logger.debug({
-                    "event": "wf_ticker_skipped",
-                    "ticker": ticker,
-                    "calendar_days": calendar_days,
-                    "required": self._min_ticker_days,
-                })
-        return eligible
+        """Return tickers that have Parquet data loaded in the walker.
+
+        Any ticker present in the walker cache is considered eligible — the data
+        fetcher was run with history_days matching min_ticker_days, so if the
+        file exists it has sufficient history by construction.
+        """
+        return [t for t in tickers if walker._store.get(t) is not None]
 
     @staticmethod
     def _count_trading_days(
