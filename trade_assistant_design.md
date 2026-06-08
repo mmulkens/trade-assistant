@@ -1,6 +1,6 @@
 # Trade Assistant — Automated Trading Design Decisions
 
-*Working Document · May 2026*
+*Working Document · June 2026*
 
 ---
 
@@ -37,8 +37,10 @@ Trade Assistant
     │
     ├── Data Fetcher         → yfinance OHLCV, Parquet cache, delta loads
     │
-    ├── Signal Engine        → EMA Pullback + Breakout strategies
-    │         (emits: conid, entry, stop, target, signal_type, liquidity_class)
+    ├── Signal Engine        → IndicatorLibrary + pluggable strategy registry
+    │         ├── prepare(tickers)      → pre-computes all indicators over full history
+    │         ├── scan(prepared, date)  → slices to date, applies strategy logic
+    │         └── (emits: conid, entry, stop, target, signal_type, liquidity_class)
     │
     ├── Risk Layer           → position sizing, 1.5% / 6% hard caps
     │
@@ -50,8 +52,8 @@ Trade Assistant
     ├── Position Manager     → ATR trail, cost floor, time-based exits, manual exit detection
     │
     ├── Walk-Forward Simulator → strategy validation on historical data
-    │         ├── DataFrame Walker      (cache interception, lookahead prevention)
-    │         ├── Signal Engine         (reused unchanged via constructor injection)
+    │         ├── DataFrame Walker      (cache interception, lookahead prevention for SimPM)
+    │         ├── Signal Engine         (prepare() called once pre-loop; scan() per day)
     │         ├── Risk Layer            (reused unchanged, isolated state DB)
     │         ├── Sim Executor          (reused unchanged)
     │         └── Sim Position Manager  (bar-by-bar exit simulation)
@@ -289,6 +291,28 @@ Anchored VWAP bounce strategy designed but deferred from Phase 1.
 - Candidate anchor rules: most recent earnings gap, most recent 52-week low, most recent breakout day
 
 *Rejected:* AVWAP with a fixed universal anchor — drift problem invalidates it.
+
+### J. Two-Phase Architecture — IndicatorLibrary and Strategy Registry
+
+**Problem:** the original Signal Engine computed all indicators (EMAs, MACD, ATR, RS) inside `_scan_one()` on every call. In the Walk-Forward Simulator this means recomputing the full indicator stack for every ticker on every simulated day — O(days × tickers) computations. For a 250-day simulation over 2,000 tickers this made WF runs take minutes, defeating the purpose of rapid strategy iteration.
+
+**Decision: split the Signal Engine into two explicit phases.**
+
+**Phase 1 — `prepare(tickers)`**: loads OHLCV for every ticker and computes all indicators over the full history. Returns an enriched dataset (dict of ticker → OHLCV DataFrame + indicator Series dict). Called once — before the WF day loop, or once per live scan.
+
+**Phase 2 — `scan(prepared_data, as_of_date)`**: slices the pre-computed data to `as_of_date` and applies strategy logic. Pure lookups — no recomputation. Called once per simulated day in WF mode; in live mode `scan(tickers)` calls `prepare()` internally so all existing call sites require no changes.
+
+**IndicatorLibrary (`indicators.py` registry):** a named registry of pure indicator functions. Each entry maps a canonical string name (e.g. `"ema_21"`, `"macd_hist"`, `"atr_14"`) to a callable that takes an OHLCV DataFrame and returns a Series. The `prepare()` phase calls `indicators.compute(name, df)` for each name in the union of requirements across active strategies. New indicators are added to the registry without touching the engine or any existing strategy.
+
+**Strategy registry (config-driven):** active strategies are declared in `config.yaml` under `signal_engine.active_strategies` (default: `[strategy_a, strategy_b]`). The engine discovers and loads them at startup via a `_STRATEGY_MODULES` dict in `engine.py`. Adding a new strategy requires: (1) creating `strategy_c.py`, (2) adding one entry to `_STRATEGY_MODULES`, (3) adding `strategy_c` to config. No other files change.
+
+**Strategy interface contract:** each strategy class declares `required_indicators: list[str]` as a class attribute — the names it needs from the library. Its `evaluate(df, indicators)` method receives the pre-sliced OHLCV DataFrame and a dict of pre-sliced indicator Series. Strategies never compute indicators themselves.
+
+**WF performance result:** indicator computation drops from O(days × tickers) to O(tickers). A 250-day simulation over 2,000 tickers goes from minutes to seconds.
+
+**Live trading cost:** unchanged. The live path (`scan(tickers)`) calls `prepare()` then `scan()` internally in one call — the two phases are sequential as before, just now explicit. No additional compute versus the original design.
+
+**Walker role shift:** the DataFrame Walker's primary lookahead-prevention role shifts from indicator computation (now enforced by the `as_of_date` slice in `_scan_prepared`) to raw OHLCV reads by SimPM. Both mechanisms enforce the same guarantee.
 
 ---
 
@@ -1125,51 +1149,62 @@ The Signal Engine receives the Walker via constructor injection (SE-25). All cac
 
 The Walker is testable in isolation: given a ticker, a cache directory, and a date, assert that the returned DataFrame's last index equals exactly that date.
 
-### C. Signal Engine Constructor Injection (SE-25)
+### C. Signal Engine Integration (SE-25, SE-27, SE-28)
 
-One small change to `signal_engine/engine.py` enables the Walker to be passed in:
+The WF runner integrates with the Signal Engine in two phases. This is the primary performance optimisation — indicators are computed once over the full history, not once per simulation day.
+
+**Before the day loop — pre-computation:**
 
 ```python
-# Before
-def __init__(self, config: dict, logger: Logger) -> None:
-    # internally calls: cache_store.load(ticker, self._cache_dir)
+# Instantiate SE with the Walker as the cache source (SE-25)
+engine = SignalEngine(config, logger, cache=walker)
 
-# After
-def __init__(self, config: dict, logger: Logger, cache=cache_store) -> None:
-    self._cache = cache
-    # internally calls: self._cache.load(ticker, self._cache_dir)
+# Pre-compute all indicators for all tickers over full history (SE-27)
+prepared_data = engine.prepare(tickers, benchmark_df=benchmark_df)
 ```
 
-In production nothing changes — the default `cache=cache_store` means existing call sites require no modification. The Walk-Forward Simulator passes its Walker as `cache=walker`. The Signal Engine has no knowledge of the substitution.
+`prepare()` loads each ticker's full Parquet cache and computes the union of all indicators required by the active strategies (via the IndicatorLibrary registry). The result is a dict of ticker → `{df, indicators}` held in memory for the duration of the run.
+
+**Inside the day loop — scan with pre-computed data:**
+
+```python
+# Scan using pre-computed data, sliced to sim_date (SE-28)
+signals = engine.scan(prepared_data, as_of_date=sim_date)
+```
+
+`scan()` receives the pre-computed dict and an `as_of_date`. It slices each ticker's DataFrame and indicator Series to `<= as_of_date` before evaluating strategies. No indicator recomputation occurs inside the loop.
+
+**Lookahead prevention:** enforced by the `as_of_date` slice in `_scan_prepared()`. The Walker remains present and handles raw OHLCV reads by SimPM (ATR sourcing) — the same no-lookahead guarantee is maintained via both mechanisms.
+
+**Live path unchanged:** in production, `engine.scan(tickers)` calls `prepare()` internally before scanning. All existing call sites require no modification.
 
 ### D. Day Loop
 
-The simulator advances through contiguous trading days from `start_date` to `end_date`. On each iteration the loop is "between" two trading days: day D-1 has just closed, and day D is about to be revealed.
+The simulator advances through contiguous trading days from `start_date` to `end_date`. `prepared_data` is available throughout — computed once before the loop begins.
 
 ```
+Before loop: engine.prepare(tickers) → prepared_data (indicators pre-computed over full history)
+
 For each trading day D (from first warm day to end_date):
 
     Step 1 — Signal Engine scans on D-1 close data
-        Walker is set to D-1; engine.scan(tickers) → raw signals
+        engine.scan(prepared_data, as_of_date=D-1) → pre-ranked signals
+        (slices pre-computed indicators to D-1; no recomputation)
 
-    Step 2 — Rank signals
-        Elevated conviction first
-        Within same conviction tier: tightest stop distance % of entry
-
-    Step 3 — Risk Layer evaluates ranked signals
+    Step 2 — Risk Layer evaluates ranked signals
         Uses portfolio_value from end of D-1 (previous iteration's Step 6)
         For each signal in ranked order:
             RL.evaluate(signal) with simulated portfolio value and isolated DB
             If approved: queue fill at P_close(D-1)
             If rejected: record in wf_signals with reject reason
 
-    Step 4 — Reveal day D bar
+    Step 3 — Reveal day D bar
         Walker advances to D
         For each queued fill:
             If bar_D.low <= P_close(D-1) <= bar_D.high → entry confirmed at P_close(D-1)
             Else (price gapped away) → entry skipped, record as 'rejected_gap'
 
-    Step 5 — Sim Position Manager evaluates ALL open positions against bar D
+    Step 4 — Sim Position Manager evaluates ALL open positions against bar D
         ATR sourced from walker.load(ticker, cache_dir) truncated to D — no lookahead
         Check exits in this order (first match per position wins):
             1. Gap stop:      bar_D.open <= active_stop → exit at bar_D.open
@@ -1181,11 +1216,11 @@ For each trading day D (from first warm day to end_date):
             5. Time exit:     hold_days >= 7 AND trail not active →
                               evaluate conditions → exit at bar_D.close if met
 
-    Step 6 — Update simulated portfolio value (end-of-day, last step)
+    Step 5 — Update simulated portfolio value (end-of-day, last step)
         portfolio_value += sum(net_pnl) for positions closed this iteration
-        This updated value is used by the Risk Layer in the next iteration's Step 3
+        This updated value is used by the Risk Layer in the next iteration's Step 2
 
-    Step 7 — Store equity curve row
+    Step 6 — Store equity curve row
         wf_equity_curve: (run_id, date=D, portfolio_value, open_positions, open_risk_pct)
 ```
 
@@ -1364,7 +1399,7 @@ A ticker is eligible for simulation if its Parquet cache file is present in the 
 
 **Current index membership:** the universe is the current S&P 500, Nasdaq 100, and Russell 2000 constituents as of the run date. No historical constituent tracking is performed in v1.
 
-**Future optimisation:** pre-computing all indicator series once per ticker across the full cache, then slicing into the simulation, would make reruns near-instant and eliminate repeated recalculation. Deferred to v2+ — for v1, indicators are recomputed from the truncated view on each simulation day.
+**Indicator pre-computation:** all indicator series are computed once per ticker across the full cache before the day loop begins (`engine.prepare(tickers)`). The day loop slices the pre-computed series to `as_of_date` on each iteration — no recomputation occurs inside the loop. See Design Consideration 2J for the full two-phase SE architecture.
 
 ### Q. Known Limitations (v1)
 
@@ -1433,6 +1468,11 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | SE-24 | Signal Engine | Log intraday run results: tickers evaluated, skipped (with reason), signals fired, rejection store additions | Must |
 | SE-25 | Signal Engine | Accept optional `cache` parameter in constructor (default: real `cache_store`); use `self._cache.load()` internally — enables DataFrame Walker injection for walk-forward simulation without any other Signal Engine code changes | Must |
 | SE-26 | Signal Engine | `scan()` returns signals already ranked by priority (elevated conviction first, then tightest stop % within tier); assign `signal_rank` (1 = highest) to each Signal before returning — ranking is owned by SE, not by callers | Must |
+| SE-27 | Signal Engine | Implement `prepare(tickers, benchmark_df) -> dict` — loads OHLCV for each ticker and pre-computes all indicators required by active strategies over full history; returns enriched dataset keyed by ticker; called once before WF day loop or internally by live `scan()` | Must |
+| SE-28 | Signal Engine | `scan()` supports two calling signatures: (1) `scan(tickers)` for live mode — calls `prepare()` internally, backward-compatible with all existing call sites; (2) `scan(prepared_data, as_of_date)` for WF mode — slices pre-computed data to `as_of_date`, no recomputation | Must |
+| SE-29 | Signal Engine | Implement IndicatorLibrary registry in `indicators.py`: a `REGISTRY` dict mapping canonical string names (e.g. `"ema_21"`, `"macd_hist"`, `"atr_14"`) to pure callables `(df: DataFrame, **kwargs) -> Series`; expose `compute(name, df, **kwargs)` function; new indicators are added to the registry without modifying any strategy or engine code | Must |
+| SE-30 | Signal Engine | Each strategy class declares `required_indicators: list[str]` — the canonical indicator names it needs from the IndicatorLibrary; `evaluate(df, indicators)` receives pre-sliced OHLCV and a pre-sliced indicator dict; strategies never compute indicators internally | Must |
+| SE-31 | Signal Engine | Strategy registry: active strategies declared in `config.yaml` under `signal_engine.active_strategies` (default: `["strategy_a", "strategy_b"]`); engine loads them at startup via `_STRATEGY_MODULES` dict; adding a new strategy requires only: creating `strategy_c.py`, adding one entry to `_STRATEGY_MODULES`, and updating config | Must |
 
 ### Risk Layer
 
@@ -1569,9 +1609,9 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 |---|---|---|---|
 | WF-01 | Walk-Forward Simulator | Advance a date cursor through contiguous trading days from `start_date` to `end_date`; on each day present only data up to that date to all downstream components | Must |
 | WF-02 | Walk-Forward Simulator | Implement DataFrame Walker: drop-in replacement for `data_fetcher.cache` exposing the same `load(ticker, cache_dir)` interface; returns `df[df.index <= current_date]` — no Parquet files modified | Must |
-| WF-03 | Walk-Forward Simulator | Inject DataFrame Walker into Signal Engine via constructor parameter (SE-25); no other Signal Engine code changes | Must |
+| WF-03 | Walk-Forward Simulator | Inject DataFrame Walker into Signal Engine via constructor parameter (SE-25); Walker handles raw OHLCV reads by SimPM — lookahead prevention for indicator data is enforced by the `as_of_date` slice in `engine.scan()` | Must |
 | WF-04 | Walk-Forward Simulator | Skip warmup days: do not begin simulation until `min_bars` of data exist for the benchmark; log warmup days skipped and first effective simulation date in run summary | Must |
-| WF-05 | Walk-Forward Simulator | Day loop order per iteration: (1) signal engine scans on D-1 close and returns pre-ranked signals (SE-26), (2) risk layer evaluates each signal in rank order, sizing each to available room (RL-01–03), (3) sim PM evaluates all open positions against bar D, (4) update portfolio value, (5) store equity curve row | Must |
+| WF-05 | Walk-Forward Simulator | Day loop order per iteration: (1) signal engine scans pre-computed data sliced to D-1 and returns pre-ranked signals (SE-26, SE-28), (2) risk layer evaluates each signal in rank order, sizing each to available room (RL-01–03), (3) reveal day D bar and confirm or gap-reject queued entries, (4) sim PM evaluates all open positions against bar D, (5) update portfolio value, (6) store equity curve row | Must |
 | WF-06 | Walk-Forward Simulator | Signal ranking criteria: elevated conviction first; within same tier, tightest stop distance % of entry first — ranking is performed by SE.scan() before the runner sees the signal list (see SE-26) | Must |
 | WF-07 | Walk-Forward Simulator | Gap check on entry: if bar_D does not overlap P_close(D-1), skip entry and record outcome as `rejected_gap` in `wf_signals` | Must |
 | WF-08 | Walk-Forward Simulator | Gap-aware exit fill: `exit_price = bar_D.open` if `bar_D.open <= active_stop`; else `exit_price = active_stop` if `bar_D.low <= active_stop`; set `gap_filled = true` when filled at open — this is fill information, not an exit reason, and can accompany any exit type | Must |
@@ -1600,6 +1640,8 @@ Priority: **Must** (non-negotiable) · **Should** (strongly recommended for v1) 
 | WF-31 | Walk-Forward Simulator | Universe scope: current S&P 500, Nasdaq 100, and Russell 2000 constituents as of run date; no historical constituent tracking in v1 | Must |
 | WF-32 | Walk-Forward Simulator | Data gaps in eligible tickers: forward-fill with last known bar before simulation begins; log a warning per gap-filled ticker and record in `wf_runs` | Must |
 | WF-33 | Walk-Forward Simulator | Reset the daily loss limit flag (`trading_paused_date`) at the start of each simulated day — mirrors live behavior where the limit expires at midnight; store position `closed_at` with the simulated date so `get_daily_realized_pnl()` accumulates P&L per simulated day, not per real wall-clock day | Must |
+| WF-34 | Walk-Forward Simulator | Call `engine.prepare(tickers, benchmark_df)` once before the day loop begins; pass the returned `prepared_data` dict to `engine.scan(prepared_data, as_of_date=sim_date)` on each iteration — no indicator recomputation inside the loop | Must |
+| WF-35 | Walk-Forward Simulator | Support `--strategies` CLI flag (comma-separated list, e.g. `--strategies strategy_b`) to override `active_strategies` from config for a specific run; enables isolated per-strategy backtests without editing config | Should |
 
 ---
 
