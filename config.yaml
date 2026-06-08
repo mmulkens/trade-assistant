@@ -45,7 +45,7 @@ costs:
 # -----------------------------------------------------------------------------
 data_fetcher:
   provider: 'yfinance'          # OHLCV data provider — 'yfinance' (default) or 'eodhd'
-  history_days: 700             # Calendar days of OHLCV history to fetch per ticker
+  history_days: 2000             # Calendar days of OHLCV history to fetch per ticker
                                  # 700 days ≈ 490 trading bars — extended for walk-forward simulation
                                  # (EMA200 warmup ~200 bars + meaningful simulation runway)
   workers: 8                    # Parallel threads per batch for fetching tickers
@@ -92,7 +92,7 @@ signal_engine:
   # --- Stop price calculation ---
   swing_low_period: 10          # Bars to look back for the structural stop (lowest low)
                                  # Stop is placed below the most recent swing low
-  stop_atr_multiplier: 1.5      # ATR floor multiplier: stop must be at least this many ATRs
+  stop_atr_multiplier: 2.5      # ATR floor multiplier: stop must be at least this many ATRs
                                  # below entry — prevents stops that are too tight for daily noise
   stop_hard_cap_pct: 8.0        # Maximum stop distance as % of entry price
                                  # Prevents extreme stops on volatile names; signals that hit
