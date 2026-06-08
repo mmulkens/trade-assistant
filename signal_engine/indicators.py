@@ -7,6 +7,8 @@
 # future components (e.g. Position Manager also needs ATR).
 # ---------------------------------------------------------------------------
 
+from typing import Callable
+
 import pandas as pd
 
 
@@ -101,3 +103,48 @@ def rs_line(close: pd.Series, benchmark_close: pd.Series) -> pd.Series:
     # Forward-fill handles calendar mismatches between stock and index
     aligned = benchmark_close.reindex(close.index, method="ffill")
     return close / aligned
+
+
+# ---------------------------------------------------------------------------
+# IndicatorLibrary — named registry for pre-computation in SignalEngine
+#
+# Maps canonical string names to callables: (df: DataFrame, **kwargs) → Series.
+# The engine collects the union of required indicators across all active
+# strategies and calls compute() once per ticker in prepare() — before any
+# day loop — so each series is available for fast lookups throughout the sim.
+#
+# MACD is decomposed into three separate entries so callers never need to
+# unpack tuples; the engine calls each by name and stores the Series directly.
+# ---------------------------------------------------------------------------
+
+REGISTRY: dict[str, Callable] = {
+    "ema_21":      lambda df, **_: ema(df["close"], 21),
+    "ema_50":      lambda df, **_: ema(df["close"], 50),
+    "ema_100":     lambda df, **_: ema(df["close"], 100),
+    "ema_200":     lambda df, **_: ema(df["close"], 200),
+    "macd_line":   lambda df, **_: macd(df["close"], 12, 26, 9)[0],
+    "macd_signal": lambda df, **_: macd(df["close"], 12, 26, 9)[1],
+    "macd_hist":   lambda df, **_: macd(df["close"], 12, 26, 9)[2],
+    "atr_14":      lambda df, **_: atr(df, 14),
+    "rs_line":     lambda df, benchmark_df=None, **_: (
+                       rs_line(df["close"], benchmark_df["close"])
+                       if benchmark_df is not None else pd.Series(dtype=float)
+                   ),
+    "high_50d":    lambda df, **_: df["high"].rolling(50).max(),
+    "high_52wk":   lambda df, **_: df["high"].rolling(252).max(),
+    "vol_20d_avg": lambda df, **_: df["volume"].rolling(20).mean(),
+}
+
+
+def compute(name: str, df: pd.DataFrame, **kwargs) -> pd.Series:
+    """Compute a named indicator by looking it up in REGISTRY.
+
+    Raises KeyError if the name is not registered.
+    kwargs are forwarded to the indicator function (e.g. benchmark_df for rs_line).
+    """
+    if name not in REGISTRY:
+        raise KeyError(
+            f"Indicator '{name}' not found in REGISTRY. "
+            f"Available: {sorted(REGISTRY.keys())}"
+        )
+    return REGISTRY[name](df, **kwargs)

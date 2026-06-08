@@ -28,11 +28,19 @@ class StrategyB:
         50 days is the practical sweet spot between frequency and quality.
     """
 
+    # Indicators the engine must pre-compute and pass to evaluate()
+    required_indicators: list[str] = [
+        "ema_21", "ema_50", "ema_100", "ema_200",
+        "macd_line",
+        "atr_14",
+        "high_50d",
+        "vol_20d_avg",
+    ]
+
     def __init__(self, config: dict) -> None:
         se = config["signal_engine"]
         self._breakout_period: int = se["breakout_period"]                        # 50
         self._volume_multiplier: float = se.get("breakout_volume_multiplier", 1.5)
-        self._volume_avg_days: int = se.get("liquidity_avg_days", 20)
 
     @property
     def min_bars_required(self) -> int:
@@ -47,22 +55,31 @@ class StrategyB:
     def evaluate(
         self,
         df: pd.DataFrame,
-        close: float,
-        macd_line: pd.Series,
+        indicators: dict[str, pd.Series],
     ) -> tuple[bool, str]:
         """Evaluate the 50-Day Breakout setup on the most recent bar.
 
         Returns (True, '') if all conditions pass.
         Returns (False, reason_code) at the first failing condition.
+
+        df and indicators are both pre-sliced to the scan date by the engine.
+        Do not compute indicators here — use what was passed in.
         """
         if len(df) < self.min_bars_required:
             return False, "strategy_b:insufficient_data"
+
+        close = float(df["close"].iloc[-1])
 
         # ---------------------------------------------------------------
         # Condition 1 — Fresh breakout above 50-day high
         #
         # Today's close must exceed the highest high of the prior N bars
         # (today's bar is excluded from the window to avoid look-ahead bias).
+        #
+        # high_50d is a rolling(50).max() series pre-computed over full history.
+        # iloc[-2] is yesterday's value = max of the 50 bars ending yesterday,
+        # which is equivalent to df["high"].iloc[-51:-1].max() — the prior
+        # 50-day high at yesterday's close, excluding today's bar.
         #
         # Freshness check: this must be the FIRST day of the breakout.
         # If yesterday's close already exceeded the N-day high as it stood
@@ -74,14 +91,12 @@ class StrategyB:
         # swing low is fixed while entry has moved up, pushing risk % higher.
         # This explains why stale signals disproportionately hit the hard cap.
         # ---------------------------------------------------------------
-        prior_high_today = float(df["high"].iloc[-(self._breakout_period + 1):-1].max())
+        high_50d = indicators["high_50d"]
+        prior_high_today = float(high_50d.iloc[-2])      # 50d high as of yesterday
         if close <= prior_high_today:
             return False, "strategy_b:no_50d_breakout"
 
-        # Freshness: was yesterday already a breakout day?
-        # prior_high_yesterday = the N-day high as it stood at yesterday's close
-        # (window ends two days ago, same N-day length, shifted back one bar)
-        prior_high_yesterday = float(df["high"].iloc[-(self._breakout_period + 2):-2].max())
+        prior_high_yesterday = float(high_50d.iloc[-3])  # 50d high as of 2 days ago
         close_yesterday = float(df["close"].iloc[-2])
         if close_yesterday > prior_high_yesterday:
             return False, "strategy_b:stale_breakout"
@@ -94,6 +109,7 @@ class StrategyB:
         # fast EMA is above the slow EMA — broad trend is bullish.  The line
         # rising means that trend is currently accelerating.
         # ---------------------------------------------------------------
+        macd_line = indicators["macd_line"]
         if len(macd_line) < 2:
             return False, "strategy_b:insufficient_macd_bars"
 
@@ -116,7 +132,7 @@ class StrategyB:
         # not participating, and the move is likely to stall or reverse.
         # This is a core principle of IBD / O'Neil breakout methodology.
         # ---------------------------------------------------------------
-        avg_volume   = float(df["volume"].iloc[-self._volume_avg_days:].mean())
+        avg_volume   = float(indicators["vol_20d_avg"].iloc[-1])
         today_volume = float(df["volume"].iloc[-1])
 
         # Guard against zero-volume edge case in illiquid instruments

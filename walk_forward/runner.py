@@ -39,6 +39,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from data_fetcher import cache as real_cache
 from risk_layer.layer import RiskLayer
 from risk_layer import state as rl_state
 from position_manager import state as pm_state
@@ -177,6 +178,19 @@ class WalkForwardRunner:
         walker.advance(sim_dates[0] - pd.Timedelta(days=1))
         prev_date_str: str = (sim_dates[0] - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
+        # --- Pre-compute all indicators for the full universe ---
+        # Reads full history from the real Parquet cache (not the walker) so
+        # prepared_data covers the entire simulation window. Each day loop
+        # iteration slices this data to prev_date_str — no recomputation.
+        # Benchmark is also loaded from real cache to provide RS line history.
+        bench_full_df = real_cache.load(self._benchmark, self._cache_dir)
+        logger.info({"event": "wf_preparing_indicators", "tickers": len(eligible)})
+        prepared_data = signal_engine.prepare(eligible, benchmark_df=bench_full_df)
+        logger.info({
+            "event": "wf_indicators_ready",
+            "tickers_prepared": len(prepared_data),
+        })
+
         for date in sim_dates:
             date_str = date.strftime("%Y-%m-%d")
 
@@ -185,11 +199,12 @@ class WalkForwardRunner:
 
             # ---------------------------------------------------------------
             # Step 1 — Scan for signals on D-1 data
-            # Walker is still at prev_date (D-1); engine.scan() sees D-1's
-            # close as df.iloc[-1]. entry_price = D-1's close for all signals.
+            # prepared_data contains full history; passing as_of_date=prev_date_str
+            # slices each ticker's df and indicators to D-1, so df.iloc[-1] is
+            # D-1's close. entry_price = D-1's close for all signals.
             # scan() returns signals already ranked (signal_rank=1 is best).
             # ---------------------------------------------------------------
-            ranked = signal_engine.scan(eligible)
+            ranked = signal_engine.scan(prepared_data, as_of_date=prev_date_str)
 
             # Advance walker to D — all subsequent bar reads expose today's OHLCV.
             walker.advance(date)

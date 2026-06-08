@@ -84,6 +84,7 @@ def _cmd_run(config: dict) -> None:
     logger = _build_logger(config)
     tickers = _load_tickers(config)
 
+
     if not tickers:
         print("No tickers found in watchlist.  Check config.yaml watchlist section.")
         sys.exit(1)
@@ -165,7 +166,21 @@ def _cmd_summary(config: dict, args: list[str]) -> None:
 
 def main() -> None:
     config = _load_config()
-    argv   = sys.argv[1:]
+
+    # Strip --strategies <list> from argv before dispatching to subcommands.
+    # Accepted forms: --strategies strategy_a  or  --strategies strategy_a,strategy_b
+    # Overrides active_strategies in config for this run only.
+    raw_argv = sys.argv[1:]
+    argv: list[str] = []
+    i = 0
+    while i < len(raw_argv):
+        if raw_argv[i] == "--strategies" and i + 1 < len(raw_argv):
+            names = [s.strip() for s in raw_argv[i + 1].split(",") if s.strip()]
+            config["signal_engine"]["active_strategies"] = names
+            i += 2
+        else:
+            argv.append(raw_argv[i])
+            i += 1
 
     if not argv or argv[0] == "run":
         _cmd_run(config)
@@ -182,9 +197,10 @@ def main() -> None:
     else:
         print(f"Unknown command: {cmd!r}")
         print("Usage:")
-        print("  python -m walk_forward [run]          Run simulation")
-        print("  python -m walk_forward runs           List past runs")
-        print("  python -m walk_forward summary <id>   Show run summary")
+        print("  python -m walk_forward [run]                         Run simulation")
+        print("  python -m walk_forward run --strategies strategy_a   Run with one strategy")
+        print("  python -m walk_forward runs                          List past runs")
+        print("  python -m walk_forward summary <id>                  Show run summary")
         sys.exit(1)
 
 

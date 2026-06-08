@@ -30,6 +30,13 @@ class StrategyA:
         institutional backing; EMA10 is too noisy for swing timeframes.
     """
 
+    # Indicators the engine must pre-compute and pass to evaluate()
+    required_indicators: list[str] = [
+        "ema_21", "ema_50", "ema_100", "ema_200",
+        "macd_hist",
+        "atr_14",
+    ]
+
     def __init__(self, config: dict) -> None:
         pass  # All parameters come from the engine; strategy_a has no config of its own
 
@@ -41,12 +48,7 @@ class StrategyA:
     def evaluate(
         self,
         df: pd.DataFrame,
-        close: float,
-        ema21: pd.Series,
-        ema50: pd.Series,
-        ema100: pd.Series,
-        ema200: pd.Series,
-        histogram: pd.Series,
+        indicators: dict[str, pd.Series],
     ) -> tuple[bool, str]:
         """Evaluate the EMA Pullback setup on the most recent bar.
 
@@ -54,9 +56,13 @@ class StrategyA:
         Returns (False, reason_code) at the first failing condition.
         The reason_code identifies exactly which gate blocked the signal,
         and is logged by the engine for every skipped ticker.
+
+        df and indicators are both pre-sliced to the scan date by the engine.
+        Do not compute indicators here — use what was passed in.
         """
-        e21 = float(ema21.iloc[-1])
-        e50 = float(ema50.iloc[-1])
+        e21   = float(indicators["ema_21"].iloc[-1])
+        e50   = float(indicators["ema_50"].iloc[-1])
+        close = float(df["close"].iloc[-1])
 
         # Price must still be above EMA50 — the engine's Guard A confirms the full
         # EMA chain is aligned, but we also require close > EMA50 to ensure price
@@ -109,6 +115,7 @@ class StrategyA:
         # The prior-decline requirement prevents this from firing on random
         # single-bar noise or on histograms that were never negative.
         # ---------------------------------------------------------------
+        histogram = indicators["macd_hist"]
         if len(histogram) < 3:
             return False, "strategy_a:insufficient_macd_bars"
 
