@@ -29,18 +29,25 @@ class StrategyB:
     """
 
     # Indicators the engine must pre-compute and pass to evaluate()
+    # rs_line is optional — only present when a benchmark_df was provided to prepare().
+    # evaluate() degrades gracefully when it is absent.
     required_indicators: list[str] = [
         "ema_21", "ema_50", "ema_100", "ema_200",
         "macd_line",
         "atr_14",
         "high_50d",
         "vol_20d_avg",
+        "rs_line",
     ]
 
     def __init__(self, config: dict) -> None:
         se = config["signal_engine"]
         self._breakout_period: int = se["breakout_period"]                        # 50
         self._volume_multiplier: float = se.get("breakout_volume_multiplier", 1.5)
+        # Maximum % below the RS line's own 52-week high for the filter to pass.
+        # If the RS line is further below its yearly peak than this threshold the
+        # stock is no longer a relative-strength leader — skip the signal.
+        self._rs_high_pct: float = se.get("rs_52wk_high_pct", 5.0)
 
     @property
     def min_bars_required(self) -> int:
@@ -139,5 +146,44 @@ class StrategyB:
         if avg_volume > 0 and today_volume < self._volume_multiplier * avg_volume:
             ratio = round(today_volume / avg_volume, 2)
             return False, f"strategy_b:low_volume_{ratio}x"
+
+        # ---------------------------------------------------------------
+        # Condition 4 — RS line at or near its 52-week high
+        #
+        # The Relative Strength line (stock price / benchmark price) must be
+        # within rs_52wk_high_pct% of its own 52-week high at the time of the
+        # breakout.  A declining RS line means institutional money has been
+        # rotating out of this stock even while the absolute price rose —
+        # these breakouts have significantly lower follow-through probability.
+        #
+        # A stock with an RS line at a new high is already leading the market
+        # before the price breakout fires.  This is the "RS line leading"
+        # concept: the signal confirms an acceleration of existing leadership,
+        # not a last-gasp move by an extended stock.
+        #
+        # The threshold (default 5%) is lenient enough to tolerate normal
+        # day-to-day fluctuation in the price/benchmark ratio, while still
+        # excluding stocks whose RS line peaked months ago and has since
+        # been trending lower.
+        #
+        # Graceful degradation: if rs_line was not pre-computed (no benchmark
+        # provided to prepare()), this condition is skipped rather than
+        # rejecting all signals in that mode.
+        # ---------------------------------------------------------------
+        rs_series = indicators.get("rs_line")
+        if rs_series is None or len(rs_series) < 2:
+            # benchmark_df is mandatory; if rs_line is absent the engine was
+            # called without one — reject rather than silently skip the check.
+            return False, "strategy_b:rs_line_missing"
+
+        bars_for_rs_52wk = min(252, len(rs_series))
+        rs_52wk_high = float(rs_series.iloc[-bars_for_rs_52wk:].max())
+        rs_today = float(rs_series.iloc[-1])
+        if pd.isna(rs_today):
+            return False, "strategy_b:rs_line_nan"
+        threshold = rs_52wk_high * (1 - self._rs_high_pct / 100)
+        if rs_today < threshold:
+            pct_below = round((rs_52wk_high - rs_today) / rs_52wk_high * 100, 1)
+            return False, f"strategy_b:rs_line_not_leading_{pct_below}pct_below_peak"
 
         return True, ""

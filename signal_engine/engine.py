@@ -181,9 +181,13 @@ class SignalEngine:
     def prepare(
         self,
         tickers: list[str],
-        benchmark_df: Optional[pd.DataFrame] = None,
+        benchmark_df: pd.DataFrame,
     ) -> dict[str, dict]:
         """Pre-compute all required indicators for every ticker over full history.
+
+        benchmark_df is required. It is used for the market regime filter and
+        for computing the RS line (stock / benchmark ratio), which Strategy B
+        requires as a mandatory filter condition.
 
         Always reads from the real Parquet cache (cache_store), never from
         self._cache (the walker). The walker is a scanning-time concern: its
@@ -202,14 +206,12 @@ class SignalEngine:
         Call once before a WF day loop and pass the result to scan().
         In live mode, scan(tickers) calls prepare() internally.
         """
-        # Union of indicators required by all active strategies
+        # Union of indicators required by all active strategies, always
+        # including rs_line — benchmark_df is mandatory for this reason.
         required: set[str] = set()
         for _, strategy in self._strategies:
             required.update(strategy.required_indicators)
-
-        # RS line requires a benchmark; include it whenever one is provided
-        if benchmark_df is not None:
-            required.add("rs_line")
+        required.add("rs_line")
 
         prepared: dict[str, dict] = {}
         for ticker in tickers:
@@ -253,17 +255,17 @@ class SignalEngine:
                      not the execution day (D), to preserve lookahead safety.
         """
         if isinstance(tickers_or_prepared, list):
-            # Live path: prepare + scan in one call (backward-compatible)
+            # Live path: prepare + scan in one call (backward-compatible).
+            # Benchmark is required: it drives both the regime filter and the
+            # RS line computation that Strategy B mandates.
             benchmark_df = self._cache.load(self._benchmark, self._cache_dir)
             if benchmark_df is None or len(benchmark_df) < 200:
-                self._logger.warning({
-                    "event": "benchmark_missing_or_short",
-                    "benchmark": self._benchmark,
-                    "bars": len(benchmark_df) if benchmark_df is not None else 0,
-                })
-                regime = "unknown"
-            else:
-                regime = self._market_regime(benchmark_df)
+                raise RuntimeError(
+                    f"Benchmark '{self._benchmark}' could not be loaded or has fewer "
+                    f"than 200 bars. Fetch it first with the data fetcher."
+                )
+
+            regime = self._market_regime(benchmark_df)
 
             if self._regime_filter and regime == "bear":
                 self._logger.info({
@@ -472,7 +474,10 @@ class SignalEngine:
         # --- Liquidity classification ---
         liquidity_class = self._classify_liquidity(df)
 
-        # --- RS line (annotation — not a filter) ---
+        # --- RS line (annotation + Strategy B filter) ---
+        # The rs_value on the Signal is always the raw ratio at signal time.
+        # Strategy B's evaluate() uses the full rs_line series from indicators
+        # to enforce the 52-week-high proximity filter before we get here.
         rs_val: Optional[float] = None
         rs_series = indicators.get("rs_line")
         if rs_series is not None and len(rs_series) > 0:

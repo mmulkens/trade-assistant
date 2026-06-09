@@ -111,6 +111,14 @@ signal_engine:
                                    # Catches freefall situations before lagging EMAs adjust
   trend_drawdown_period: 20        # Lookback bars for the Guard B recent-high calculation
 
+  # --- Strategy B: RS line leadership filter ---
+  rs_52wk_high_pct: 5              # Strategy B rejects a breakout signal unless the RS line
+                                    # (stock price / benchmark price) is within this % of its
+                                    # own 52-week high.  A declining RS line means the stock
+                                    # was already losing ground to the market before the price
+                                    # breakout — these signals fail at a much higher rate.
+                                    # Set to 100 to effectively disable the filter.
+
   # --- Strategy B: volume confirmation ---
   breakout_volume_multiplier: 1.5  # Breakout bar must have volume >= this × 20-day average
                                     # Ensures institutional participation; low-volume breakouts
